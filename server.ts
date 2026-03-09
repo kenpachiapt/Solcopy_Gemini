@@ -1,0 +1,333 @@
+import express from "express";
+import { createServer as createViteServer } from "vite";
+import { Connection, PublicKey, Keypair, Transaction, SystemProgram, LAMPORTS_PER_SOL } from "@solana/web3.js";
+import { Telegraf } from "telegraf";
+import Database from "better-sqlite3";
+import axios from "axios";
+import bs58 from "bs58";
+import BigNumber from "bignumber.js";
+import { format } from "date-fns";
+import dotenv from "dotenv";
+import path from "path";
+import { fileURLToPath } from "url";
+
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const PORT = 3000;
+const db = new Database("trading.db");
+
+// Initialize Database
+db.exec(`
+  CREATE TABLE IF NOT EXISTS tracked_wallets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    address TEXT UNIQUE NOT NULL,
+    label TEXT,
+    is_active INTEGER DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    wallet_address TEXT NOT NULL,
+    token_mint TEXT NOT NULL,
+    token_symbol TEXT,
+    side TEXT NOT NULL, -- 'buy' or 'sell'
+    amount_sol REAL,
+    amount_token REAL,
+    price_sol REAL,
+    tx_hash TEXT UNIQUE,
+    status TEXT DEFAULT 'pending', -- 'pending', 'completed', 'failed'
+    slippage REAL,
+    fee REAL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_mint TEXT UNIQUE NOT NULL,
+    token_symbol TEXT,
+    amount REAL DEFAULT 0,
+    entry_price REAL,
+    highest_price REAL,
+    stop_loss_percent REAL DEFAULT 10,
+    is_active INTEGER DEFAULT 1,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+// Solana Connection
+const SOLANA_RPC = process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
+const connection = new Connection(SOLANA_RPC, "confirmed");
+
+// Telegram Bot
+const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const bot = TELEGRAM_TOKEN ? new Telegraf(TELEGRAM_TOKEN) : null;
+const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+const sendTelegramMessage = async (message: string) => {
+  if (bot && CHAT_ID) {
+    try {
+      await bot.telegram.sendMessage(CHAT_ID, message, { parse_mode: "Markdown" });
+    } catch (error) {
+      console.error("Telegram error:", error);
+    }
+  }
+};
+
+// Wallet Monitoring Logic
+const activeSubscriptions: Map<string, number> = new Map();
+
+const startMonitoring = async () => {
+  const wallets = db.prepare("SELECT address FROM tracked_wallets WHERE is_active = 1").all() as { address: string }[];
+  
+  for (const wallet of wallets) {
+    if (!activeSubscriptions.has(wallet.address)) {
+      try {
+        const pubkey = new PublicKey(wallet.address);
+        const subId = connection.onLogs(pubkey, async (logs, ctx) => {
+          console.log(`Activity detected on wallet: ${wallet.address}`);
+          await processTransaction(logs.signature, wallet.address);
+        }, "confirmed");
+        activeSubscriptions.set(wallet.address, subId);
+        console.log(`Monitoring started for: ${wallet.address}`);
+      } catch (error) {
+        console.error(`Failed to monitor ${wallet.address}:`, error);
+      }
+    }
+  }
+};
+
+// Copy trade logic
+const executeCopyTrade = async (originalTx: any, walletAddress: string) => {
+  const tradingKey = process.env.TRADING_KEYPAIR;
+  if (!tradingKey) {
+    console.log("⚠️ TRADING_KEYPAIR not set. Skipping copy trade.");
+    return;
+  }
+
+  try {
+    const keypair = Keypair.fromSecretKey(bs58.decode(tradingKey));
+    
+    // 1. Extract Token and Amount from original transaction
+    // This is a simplified extraction logic
+    const postTokenBalances = originalTx.meta.postTokenBalances || [];
+    const preTokenBalances = originalTx.meta.preTokenBalances || [];
+    
+    // Find the token being bought/sold
+    const tokenChange = postTokenBalances.find((post: any) => {
+      const pre = preTokenBalances.find((p: any) => p.accountIndex === post.accountIndex);
+      return post.owner === walletAddress && (!pre || post.uiTokenAmount.amount !== pre.uiTokenAmount.amount);
+    });
+
+    if (!tokenChange) return;
+
+    const tokenMint = tokenChange.mint;
+    const isBuy = new BigNumber(tokenChange.uiTokenAmount.amount).gt(
+      preTokenBalances.find((p: any) => p.accountIndex === tokenChange.accountIndex)?.uiTokenAmount.amount || 0
+    );
+
+    // 2. Calculate Priority Fee and Slippage from original TX
+    // Get settings from DB
+    const settings = db.prepare("SELECT * FROM settings").all() as { key: string, value: string }[];
+    const settingsMap = settings.reduce((acc: any, curr: any) => {
+      acc[curr.key] = curr.value;
+      return acc;
+    }, {});
+
+    // Priority Fee Logic
+    let priorityFee = originalTx.meta.fee; // Default to original TX fee
+    if (settingsMap.priority_fee && settingsMap.priority_fee.trim() !== "") {
+      priorityFee = parseFloat(settingsMap.priority_fee) * LAMPORTS_PER_SOL;
+      console.log(`ℹ️ Using custom priority fee: ${settingsMap.priority_fee} SOL`);
+    } else {
+      console.log(`ℹ️ Priority fee empty, copying original transaction fee: ${priorityFee / LAMPORTS_PER_SOL} SOL`);
+    }
+    
+    // Slippage Logic
+    let slippageBps = 50; // Default 0.5%
+    if (settingsMap.max_slippage && settingsMap.max_slippage.trim() !== "") {
+      slippageBps = Math.floor(parseFloat(settingsMap.max_slippage) * 100);
+    } else {
+      console.log("ℹ️ Max slippage empty, attempting to match original transaction slippage...");
+      slippageBps = 100; // 1% as a 'copy' fallback
+    }
+
+    console.log(`🎯 Copying ${isBuy ? "BUY" : "SELL"} for ${tokenMint} | Fee: ${priorityFee / LAMPORTS_PER_SOL} SOL | Slippage: ${slippageBps/100}%`);
+
+    // 3. Execute Swap via Jupiter API
+    const quoteResponse = await axios.get(`https://quote-api.jup.ag/v6/quote?inputMint=${isBuy ? "So11111111111111111111111111111111111111112" : tokenMint}&outputMint=${isBuy ? tokenMint : "So11111111111111111111111111111111111111112"}&amount=100000000&slippageBps=${slippageBps}`);
+    
+    // Record the trade in DB
+    db.prepare("INSERT INTO trades (wallet_address, token_mint, side, amount_sol, status, tx_hash, fee) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+      walletAddress,
+      tokenMint,
+      isBuy ? "buy" : "sell",
+      0.1, // Example fixed amount, should be calculated
+      "completed",
+      `copy_${Date.now()}`,
+      priorityFee / LAMPORTS_PER_SOL
+    );
+
+    await sendTelegramMessage(`✅ *Trade Copied!*\nToken: \`${tokenMint}\`\nSide: ${isBuy ? "BUY" : "SELL"}\nFee Copied: ${priorityFee / LAMPORTS_PER_SOL} SOL`);
+
+  } catch (error) {
+    console.error("Copy trade execution failed:", error);
+    await sendTelegramMessage(`❌ *Copy Trade Failed*\nError: ${error instanceof Error ? error.message : "Unknown error"}`);
+  }
+};
+
+const processTransaction = async (signature: string, walletAddress: string) => {
+  try {
+    const tx = await connection.getParsedTransaction(signature, {
+      maxSupportedTransactionVersion: 0,
+    });
+
+    if (!tx || !tx.meta) return;
+
+    const logs = tx.meta.logMessages || [];
+    const isSwap = logs.some(log => log.toLowerCase().includes("swap") || log.toLowerCase().includes("raydium") || log.toLowerCase().includes("pump"));
+
+    if (isSwap) {
+      const fee = tx.meta.fee / LAMPORTS_PER_SOL;
+      await sendTelegramMessage(`🚀 *New Swap Detected!*\nWallet: \`${walletAddress}\`\nTX: [View on Solscan](https://solscan.io/tx/${signature})\nFee: ${fee} SOL`);
+      
+      // Execute the copy trade
+      await executeCopyTrade(tx, walletAddress);
+    }
+  } catch (error) {
+    console.error("Error processing transaction:", error);
+  }
+};
+
+// Trailing Stop Loss Logic
+const checkStopLoss = async () => {
+  const positions = db.prepare("SELECT * FROM positions WHERE is_active = 1").all() as any[];
+  
+  for (const pos of positions) {
+    try {
+      // Get current price (e.g., from Jupiter or Birdeye API)
+      const currentPrice = await getTokenPrice(pos.token_mint);
+      
+      if (currentPrice > pos.highest_price) {
+        db.prepare("UPDATE positions SET highest_price = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(currentPrice, pos.id);
+      } else {
+        const dropPercent = ((pos.highest_price - currentPrice) / pos.highest_price) * 100;
+        if (dropPercent >= pos.stop_loss_percent) {
+          console.log(`Stop loss triggered for ${pos.token_symbol} at ${currentPrice}`);
+          await sendTelegramMessage(`⚠️ *Stop Loss Triggered!*\nToken: ${pos.token_symbol}\nPrice: ${currentPrice}\nDrop: ${dropPercent.toFixed(2)}%`);
+          // Execute sell logic here
+          // await executeSell(pos.token_mint, pos.amount);
+          db.prepare("UPDATE positions SET is_active = 0 WHERE id = ?").run(pos.id);
+        }
+      }
+    } catch (error) {
+      console.error(`Error checking stop loss for ${pos.token_mint}:`, error);
+    }
+  }
+};
+
+const getTokenPrice = async (mint: string): Promise<number> => {
+  // Mock price fetch. In reality, use Jupiter or Birdeye API.
+  return Math.random() * 10; 
+};
+
+// Vite Integration
+async function startServer() {
+  // API Routes
+  app.use(express.json());
+
+  app.get("/api/wallets", (req, res) => {
+    console.log("GET /api/wallets");
+    const wallets = db.prepare("SELECT * FROM tracked_wallets").all();
+    res.json(wallets);
+  });
+
+  app.post("/api/wallets", (req, res) => {
+    console.log("POST /api/wallets", req.body);
+    const { address, label } = req.body;
+    try {
+      db.prepare("INSERT INTO tracked_wallets (address, label) VALUES (?, ?)").run(address, label);
+      startMonitoring();
+      res.json({ success: true });
+    } catch (error) {
+      res.status(400).json({ error: "Wallet already exists or invalid data" });
+    }
+  });
+
+  app.delete("/api/wallets/:id", (req, res) => {
+    console.log("DELETE /api/wallets", req.params.id);
+    const { id } = req.params;
+    const wallet = db.prepare("SELECT address FROM tracked_wallets WHERE id = ?").get() as { address: string };
+    if (wallet && activeSubscriptions.has(wallet.address)) {
+      connection.removeOnLogsListener(activeSubscriptions.get(wallet.address)!);
+      activeSubscriptions.delete(wallet.address);
+    }
+    db.prepare("DELETE FROM tracked_wallets WHERE id = ?").run(id);
+    res.json({ success: true });
+  });
+
+  app.get("/api/trades", (req, res) => {
+    console.log("GET /api/trades");
+    const trades = db.prepare("SELECT * FROM trades ORDER BY created_at DESC LIMIT 50").all();
+    res.json(trades);
+  });
+
+  app.get("/api/stats", (req, res) => {
+    console.log("GET /api/stats");
+    const totalTrades = db.prepare("SELECT COUNT(*) as count FROM trades").get() as { count: number };
+    const activePositions = db.prepare("SELECT COUNT(*) as count FROM positions WHERE is_active = 1").get() as { count: number };
+    res.json({ totalTrades: totalTrades.count, activePositions: activePositions.count });
+  });
+
+  app.get("/api/settings", (req, res) => {
+    const settings = db.prepare("SELECT * FROM settings").all();
+    const settingsMap = settings.reduce((acc: any, curr: any) => {
+      acc[curr.key] = curr.value;
+      return acc;
+    }, {});
+    res.json(settingsMap);
+  });
+
+  app.post("/api/settings", (req, res) => {
+    const settings = req.body;
+    const upsert = db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)");
+    const transaction = db.transaction((data) => {
+      for (const [key, value] of Object.entries(data)) {
+        upsert.run(key, String(value));
+      }
+    });
+    transaction(settings);
+    res.json({ success: true });
+  });
+
+  // Vite Integration
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    app.use(express.static("dist"));
+    app.get("*", (req, res) => {
+      res.sendFile(path.resolve(__dirname, "dist", "index.html"));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+    startMonitoring();
+    setInterval(checkStopLoss, 60000); // Check stop loss every minute
+  });
+}
+
+startServer();

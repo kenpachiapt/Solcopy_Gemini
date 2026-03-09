@@ -1,0 +1,5 @@
+{
+  "name": "Solana Copy Trader Pro",
+  "description": "Advanced Solana copy trading bot with multi-wallet tracking, automated swaps, trailing stop loss, and Telegram notifications.",
+  "requestFramePermissions": []
+}
