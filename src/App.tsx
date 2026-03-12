@@ -74,6 +74,7 @@ export default function App() {
   const [wallets, setWallets] = useState<TrackedWallet[]>([]);
   const [trades, setTrades] = useState<Trade[]>([]);
   const [stats, setStats] = useState({ totalTrades: 0, activePositions: 0 });
+  const [walletBalance, setWalletBalance] = useState({ balance: 0, address: "" });
   const [newWallet, setNewWallet] = useState({ address: "", label: "" });
   const [loading, setLoading] = useState(false);
   const [solPrice, setSolPrice] = useState(154.24);
@@ -81,20 +82,26 @@ export default function App() {
     buy_amount: "0.1",
     max_slippage: "",
     stop_loss: "15",
-    priority_fee: "0.001"
+    priority_fee: "0.001",
+    trading_keypair: "",
+    telegram_token: "",
+    telegram_chat_id: "",
+    solana_rpc: ""
   });
 
   const fetchData = async () => {
     try {
-      const [wRes, tRes, sRes, setRes] = await Promise.all([
+      const [wRes, tRes, sRes, setRes, bRes] = await Promise.all([
         fetch("/api/wallets"),
         fetch("/api/trades"),
         fetch("/api/stats"),
-        fetch("/api/settings")
+        fetch("/api/settings"),
+        fetch("/api/balance")
       ]);
       setWallets(await wRes.json());
       setTrades(await tRes.json());
       setStats(await sRes.json());
+      setWalletBalance(await bRes.json());
       const savedSettings = await setRes.json();
       if (Object.keys(savedSettings).length > 0) {
         setSettings(prev => ({ ...prev, ...savedSettings }));
@@ -232,9 +239,13 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-4">
+            <div className="flex flex-col items-end">
+              <span className="text-[10px] text-gray-500 uppercase font-bold tracking-tighter">Trading Wallet</span>
+              <span className="text-[10px] font-mono text-[#14F195]">{walletBalance.address ? `${walletBalance.address.slice(0, 4)}...${walletBalance.address.slice(-4)}` : "Not Set"}</span>
+            </div>
             <div className="flex items-center gap-3 px-4 py-1.5 bg-white/5 rounded-full border border-white/10">
               <div className="w-2 h-2 rounded-full bg-[#9945FF]" />
-              <span className="text-xs font-mono text-gray-300">0.42 SOL</span>
+              <span className="text-xs font-mono text-gray-300">{walletBalance.balance.toFixed(4)} SOL</span>
             </div>
             <button className="p-2 hover:bg-white/5 rounded-lg transition-colors relative">
               <Bell className="w-5 h-5 text-gray-400" />
@@ -548,7 +559,8 @@ export default function App() {
                       <div className="space-y-2">
                         <label className="text-[10px] text-gray-500 uppercase font-bold">Default Buy Amount (SOL)</label>
                         <input 
-                          type="number" 
+                          type="text" 
+                          placeholder="Empty = Copy from Target"
                           value={settings.buy_amount} 
                           onChange={(e) => setSettings({...settings, buy_amount: e.target.value})}
                           className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#14F195]/50" 
@@ -582,6 +594,53 @@ export default function App() {
                           onChange={(e) => setSettings({...settings, priority_fee: e.target.value})}
                           className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#14F195]/50" 
                         />
+                      </div>
+                    </div>
+
+                    <div className="h-[1px] bg-white/10 my-2"></div>
+
+                    <div className="space-y-4">
+                      <div className="space-y-2">
+                        <label className="text-[10px] text-gray-500 uppercase font-bold">Solana RPC URL</label>
+                        <input 
+                          type="text" 
+                          placeholder="https://api.mainnet-beta.solana.com"
+                          value={settings.solana_rpc} 
+                          onChange={(e) => setSettings({...settings, solana_rpc: e.target.value})}
+                          className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#14F195]/50" 
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <label className="text-[10px] text-gray-500 uppercase font-bold">Trading Keypair (Private Key)</label>
+                        <input 
+                          type="password" 
+                          placeholder="Base58 Private Key"
+                          value={settings.trading_keypair} 
+                          onChange={(e) => setSettings({...settings, trading_keypair: e.target.value})}
+                          className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#14F195]/50 font-mono" 
+                        />
+                      </div>
+                      <div className="grid grid-cols-2 gap-6">
+                        <div className="space-y-2">
+                          <label className="text-[10px] text-gray-500 uppercase font-bold">Telegram Bot Token</label>
+                          <input 
+                            type="password" 
+                            placeholder="Bot Token"
+                            value={settings.telegram_token} 
+                            onChange={(e) => setSettings({...settings, telegram_token: e.target.value})}
+                            className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#14F195]/50" 
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <label className="text-[10px] text-gray-500 uppercase font-bold">Telegram Chat ID</label>
+                          <input 
+                            type="text" 
+                            placeholder="Chat ID"
+                            value={settings.telegram_chat_id} 
+                            onChange={(e) => setSettings({...settings, telegram_chat_id: e.target.value})}
+                            className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#14F195]/50" 
+                          />
+                        </div>
                       </div>
                     </div>
                     <button 

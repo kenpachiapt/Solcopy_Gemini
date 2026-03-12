@@ -64,19 +64,34 @@ db.exec(`
   );
 `);
 
-// Solana Connection
-const SOLANA_RPC = process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
-const connection = new Connection(SOLANA_RPC, "confirmed");
+// Solana Connection Helper
+const getConnection = () => {
+  const rpcSetting = db.prepare("SELECT value FROM settings WHERE key = 'solana_rpc'").get() as { value: string } | undefined;
+  const rpcUrl = rpcSetting?.value || process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
+  return new Connection(rpcUrl, "confirmed");
+};
+
+let connection = getConnection();
 
 // Telegram Bot
-const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const bot = TELEGRAM_TOKEN ? new Telegraf(TELEGRAM_TOKEN) : null;
-const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const getTelegramConfig = () => {
+  const settings = db.prepare("SELECT * FROM settings WHERE key IN ('telegram_token', 'telegram_chat_id')").all() as { key: string, value: string }[];
+  const config = settings.reduce((acc: any, curr: any) => {
+    acc[curr.key] = curr.value;
+    return acc;
+  }, {});
+  return {
+    token: config.telegram_token || process.env.TELEGRAM_BOT_TOKEN,
+    chatId: config.telegram_chat_id || process.env.TELEGRAM_CHAT_ID
+  };
+};
 
 const sendTelegramMessage = async (message: string) => {
-  if (bot && CHAT_ID) {
+  const { token, chatId } = getTelegramConfig();
+  if (token && chatId) {
     try {
-      await bot.telegram.sendMessage(CHAT_ID, message, { parse_mode: "Markdown" });
+      const tempBot = new Telegraf(token);
+      await tempBot.telegram.sendMessage(chatId, message, { parse_mode: "Markdown" });
     } catch (error) {
       console.error("Telegram error:", error);
     }
@@ -107,10 +122,17 @@ const startMonitoring = async () => {
 };
 
 // Copy trade logic
-const executeCopyTrade = async (originalTx: any, walletAddress: string) => {
-  const tradingKey = process.env.TRADING_KEYPAIR;
+const executeCopyTrade = async (originalTx: any, walletAddress: string, currentConnection: Connection) => {
+  // Get settings from DB
+  const settings = db.prepare("SELECT * FROM settings").all() as { key: string, value: string }[];
+  const settingsMap = settings.reduce((acc: any, curr: any) => {
+    acc[curr.key] = curr.value;
+    return acc;
+  }, {});
+
+  const tradingKey = settingsMap.trading_keypair || process.env.PRIVATE_KEY || process.env.TRADING_KEYPAIR;
   if (!tradingKey) {
-    console.log("⚠️ TRADING_KEYPAIR not set. Skipping copy trade.");
+    console.log("⚠️ Trading keypair not set. Skipping copy trade.");
     return;
   }
 
@@ -118,11 +140,9 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string) => {
     const keypair = Keypair.fromSecretKey(bs58.decode(tradingKey));
     
     // 1. Extract Token and Amount from original transaction
-    // This is a simplified extraction logic
     const postTokenBalances = originalTx.meta.postTokenBalances || [];
     const preTokenBalances = originalTx.meta.preTokenBalances || [];
     
-    // Find the token being bought/sold
     const tokenChange = postTokenBalances.find((post: any) => {
       const pre = preTokenBalances.find((p: any) => p.accountIndex === post.accountIndex);
       return post.owner === walletAddress && (!pre || post.uiTokenAmount.amount !== pre.uiTokenAmount.amount);
@@ -135,21 +155,34 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string) => {
       preTokenBalances.find((p: any) => p.accountIndex === tokenChange.accountIndex)?.uiTokenAmount.amount || 0
     );
 
-    // 2. Calculate Priority Fee and Slippage from original TX
-    // Get settings from DB
-    const settings = db.prepare("SELECT * FROM settings").all() as { key: string, value: string }[];
-    const settingsMap = settings.reduce((acc: any, curr: any) => {
-      acc[curr.key] = curr.value;
-      return acc;
-    }, {});
+    // Calculate Buy Amount
+    let buyAmountSol = 0.1; // Default fallback
+    if (settingsMap.buy_amount && settingsMap.buy_amount.trim() !== "") {
+      buyAmountSol = parseFloat(settingsMap.buy_amount);
+      console.log(`ℹ️ Using custom buy amount: ${buyAmountSol} SOL`);
+    } else {
+      // Copy from original TX
+      // Find SOL change for the wallet
+      const accountKeys = originalTx.transaction.message.accountKeys;
+      const walletIndex = accountKeys.findIndex((k: any) => {
+        const pk = k.pubkey ? k.pubkey.toString() : k.toString();
+        return pk === walletAddress;
+      });
+
+      if (walletIndex !== -1) {
+        const preBal = originalTx.meta.preBalances[walletIndex];
+        const postBal = originalTx.meta.postBalances[walletIndex];
+        buyAmountSol = Math.abs(preBal - postBal) / LAMPORTS_PER_SOL;
+        // Subtract fee if it's a buy (wallet sends SOL)
+        if (isBuy) buyAmountSol -= (originalTx.meta.fee / LAMPORTS_PER_SOL);
+      }
+      console.log(`ℹ️ Buy amount empty, copying original transaction amount: ${buyAmountSol.toFixed(4)} SOL`);
+    }
 
     // Priority Fee Logic
     let priorityFee = originalTx.meta.fee; // Default to original TX fee
     if (settingsMap.priority_fee && settingsMap.priority_fee.trim() !== "") {
       priorityFee = parseFloat(settingsMap.priority_fee) * LAMPORTS_PER_SOL;
-      console.log(`ℹ️ Using custom priority fee: ${settingsMap.priority_fee} SOL`);
-    } else {
-      console.log(`ℹ️ Priority fee empty, copying original transaction fee: ${priorityFee / LAMPORTS_PER_SOL} SOL`);
     }
     
     // Slippage Logic
@@ -157,27 +190,27 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string) => {
     if (settingsMap.max_slippage && settingsMap.max_slippage.trim() !== "") {
       slippageBps = Math.floor(parseFloat(settingsMap.max_slippage) * 100);
     } else {
-      console.log("ℹ️ Max slippage empty, attempting to match original transaction slippage...");
       slippageBps = 100; // 1% as a 'copy' fallback
     }
 
-    console.log(`🎯 Copying ${isBuy ? "BUY" : "SELL"} for ${tokenMint} | Fee: ${priorityFee / LAMPORTS_PER_SOL} SOL | Slippage: ${slippageBps/100}%`);
+    const amountInLamports = Math.floor(buyAmountSol * LAMPORTS_PER_SOL);
+    console.log(`🎯 Copying ${isBuy ? "BUY" : "SELL"} for ${tokenMint} | Amount: ${buyAmountSol.toFixed(4)} SOL | Fee: ${priorityFee / LAMPORTS_PER_SOL} SOL | Slippage: ${slippageBps/100}%`);
 
     // 3. Execute Swap via Jupiter API
-    const quoteResponse = await axios.get(`https://quote-api.jup.ag/v6/quote?inputMint=${isBuy ? "So11111111111111111111111111111111111111112" : tokenMint}&outputMint=${isBuy ? tokenMint : "So11111111111111111111111111111111111111112"}&amount=100000000&slippageBps=${slippageBps}`);
+    const quoteResponse = await axios.get(`https://quote-api.jup.ag/v6/quote?inputMint=${isBuy ? "So11111111111111111111111111111111111111112" : tokenMint}&outputMint=${isBuy ? tokenMint : "So11111111111111111111111111111111111111112"}&amount=${amountInLamports}&slippageBps=${slippageBps}`);
     
     // Record the trade in DB
     db.prepare("INSERT INTO trades (wallet_address, token_mint, side, amount_sol, status, tx_hash, fee) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
       walletAddress,
       tokenMint,
       isBuy ? "buy" : "sell",
-      0.1, // Example fixed amount, should be calculated
+      buyAmountSol,
       "completed",
       `copy_${Date.now()}`,
       priorityFee / LAMPORTS_PER_SOL
     );
 
-    await sendTelegramMessage(`✅ *Trade Copied!*\nToken: \`${tokenMint}\`\nSide: ${isBuy ? "BUY" : "SELL"}\nFee Copied: ${priorityFee / LAMPORTS_PER_SOL} SOL`);
+    await sendTelegramMessage(`✅ *Trade Copied!*\nToken: \`${tokenMint}\`\nSide: ${isBuy ? "BUY" : "SELL"}\nAmount: ${buyAmountSol.toFixed(4)} SOL\nFee: ${priorityFee / LAMPORTS_PER_SOL} SOL`);
 
   } catch (error) {
     console.error("Copy trade execution failed:", error);
@@ -187,7 +220,8 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string) => {
 
 const processTransaction = async (signature: string, walletAddress: string) => {
   try {
-    const tx = await connection.getParsedTransaction(signature, {
+    const currentConnection = getConnection();
+    const tx = await currentConnection.getParsedTransaction(signature, {
       maxSupportedTransactionVersion: 0,
     });
 
@@ -201,7 +235,7 @@ const processTransaction = async (signature: string, walletAddress: string) => {
       await sendTelegramMessage(`🚀 *New Swap Detected!*\nWallet: \`${walletAddress}\`\nTX: [View on Solscan](https://solscan.io/tx/${signature})\nFee: ${fee} SOL`);
       
       // Execute the copy trade
-      await executeCopyTrade(tx, walletAddress);
+      await executeCopyTrade(tx, walletAddress, currentConnection);
     }
   } catch (error) {
     console.error("Error processing transaction:", error);
@@ -279,6 +313,32 @@ async function startServer() {
     console.log("GET /api/trades");
     const trades = db.prepare("SELECT * FROM trades ORDER BY created_at DESC LIMIT 50").all();
     res.json(trades);
+  });
+
+  app.get("/api/balance", async (req, res) => {
+    try {
+      const currentConnection = getConnection();
+      const settings = db.prepare("SELECT * FROM settings").all() as { key: string, value: string }[];
+      const settingsMap = settings.reduce((acc: any, curr: any) => {
+        acc[curr.key] = curr.value;
+        return acc;
+      }, {});
+
+      const tradingKey = settingsMap.trading_keypair || process.env.PRIVATE_KEY || process.env.TRADING_KEYPAIR;
+      if (!tradingKey) {
+        return res.json({ balance: 0, address: "Not Set" });
+      }
+
+      const keypair = Keypair.fromSecretKey(bs58.decode(tradingKey));
+      const balance = await currentConnection.getBalance(keypair.publicKey);
+      res.json({ 
+        balance: balance / LAMPORTS_PER_SOL, 
+        address: keypair.publicKey.toBase58() 
+      });
+    } catch (error) {
+      console.error("Failed to fetch balance:", error);
+      res.status(500).json({ error: "Failed to fetch balance" });
+    }
   });
 
   app.get("/api/stats", (req, res) => {
