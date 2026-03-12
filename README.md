@@ -1,58 +1,82 @@
 # Solana Pro Copy Trader 🚀
 
-Professional wallet tracking and automated copy trading bot on the Solana network. This application monitors specified wallets in real-time and automatically executes the same trades via the Jupiter API.
+Solana ağında profesyonel cüzdan takibi ve otomatik kopya işlem (copy trading) botu. Bu uygulama, belirlediğiniz cüzdanları gerçek zamanlı olarak izler ve Jupiter API aracılığıyla aynı işlemleri otomatik olarak gerçekleştirir.
 
-## 🌟 Features
+## 🌟 Özellikler
 
-- **Real-time Monitoring:** Instant tracking of wallet movements via Solana RPC.
-- **Dynamic Copying:** Option to automatically copy slippage and priority fees from the original transaction.
-- **Professional Dashboard:** Trade history, performance charts, and active target management.
-- **Secure Storage:** Local storage of wallet and trade data using SQLite database.
-- **Flexible Settings:** Custom buy amounts, stop loss, and priority fee settings.
+- **Gerçek Zamanlı İzleme:** Solana RPC üzerinden cüzdan hareketlerinin anlık takibi.
+- **Dinamik Kopyalama:** Orijinal işlemden kayma (slippage) ve öncelik ücretlerini otomatik kopyalama seçeneği.
+- **Profesyonel Panel:** İşlem geçmişi, performans grafikleri ve aktif hedef yönetimi.
+- **Güvenli Depolama:** SQLite veritabanı ile cüzdan ve işlem verilerinin yerel olarak saklanması.
+- **Esnek Ayarlar:** Özel alım miktarları, zarar durdur (stop loss) ve öncelik ücreti ayarları.
 
-## 🛠 Installation Steps
+## 🛠 Ubuntu 22.04 Kurulum Rehberi (Adım Adım)
 
-### 1. Prerequisites
-- [Node.js](https://nodejs.org/) (v18 or later)
-- A Solana RPC URL (Helius, QuickNode, or Alchemy recommended)
-- A Solana Wallet (Private Key) for transactions
+Sistemin sürekli çalışması için aşağıdaki adımları sırasıyla uygulayın.
 
-### 2. Clone the Project
+### 1. Sistemi Güncelleyin
+Terminali açın ve şu komutu yapıştırın:
 ```bash
-git clone <repository-url>
+sudo apt update && sudo apt upgrade -y
+```
+
+### 2. Node.js Kurulumu
+Uygulamanın çalışması için gerekli olan Node.js'i yükleyelim:
+```bash
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+```
+
+### 3. Projeyi İndirin
+Projeyi sunucunuza çekin:
+```bash
+git clone <buraya-repo-linkini-yazın>
 cd solana-pro-copy-trader
 ```
 
-### 3. Install Dependencies
+### 4. Bağımlılıkları Yükleyin
+Gerekli kütüphaneleri yükleyelim:
 ```bash
 npm install
 ```
 
-### 4. Configure Environment Variables
-Copy the `.env.example` file to `.env` and fill in the required fields:
-```env
-SOLANA_RPC=https://api.mainnet-beta.solana.com
-PRIVATE_KEY=your_wallet_private_key_here
-TELEGRAM_BOT_TOKEN=optional_for_notifications
-```
-
-### 5. Start the Application
+### 5. Uygulamayı Derleyin (Build)
+Arayüzün hazır hale gelmesi için:
 ```bash
-npm run dev
+npm run build
 ```
-The application will run at `http://localhost:3000` by default.
 
-## ⚙️ Configuration and Usage
+### 6. PM2 Kurulumu (Sürekli Çalışması İçin)
+Botun siz terminali kapatsanız bile çalışmaya devam etmesi için PM2 kullanalım:
+```bash
+sudo npm install -g pm2
+```
 
-1. **Add Wallet:** Go to the "Tracked Wallets" section on the dashboard and add the Solana addresses you want to follow.
-2. **Bot Settings:** From the "Settings" tab:
-   - **Default Buy Amount:** The amount of SOL to be used in each copy trade.
-   - **Max Slippage:** If left empty, it copies the slippage value of the original transaction.
-   - **Priority Fee:** If left empty, it copies the network fee of the original transaction.
-3. **Monitoring:** Once the bot starts running, every "Swap" transaction from the tracked wallets will be automatically copied and appear in the "Trade History" section.
+### 7. Botu Başlatın
+Botu PM2 ile arka planda başlatın:
+```bash
+pm2 start "npx tsx server.ts" --name solana-bot
+```
 
-## ⚠️ Important Warning
-This software is for educational and research purposes. Cryptocurrency transactions involve high risk. It is recommended to try on test networks before using real wallets and keys.
+### 8. Otomatik Başlatma Ayarı
+Sunucu yeniden başlarsa botun otomatik açılması için:
+```bash
+pm2 startup
+# (Ekrana gelen komutu kopyalayıp çalıştırın)
+pm2 save
+```
 
-## 📄 License
-This project is licensed under the MIT License.
+## ⚙️ Kullanım ve Ayarlar
+
+1. **Cüzdan Ekle:** Paneldeki "Takip Edilen Cüzdanlar" bölümüne gidin ve takip etmek istediğiniz Solana adreslerini ekleyin.
+2. **Bot Ayarları:** "Ayarlar" sekmesinden:
+   - **Varsayılan Alım Miktarı:** Her işlemde kaç SOL kullanılacağı.
+   - **Maksimum Kayma:** Boş bırakılırsa orijinal işlemin değerini kopyalar.
+   - **Öncelik Ücreti:** Boş bırakılırsa ağ ücretini otomatik ayarlar.
+3. **İzleme:** Bot çalışmaya başladığında, takip edilen cüzdanların her "Swap" işlemi otomatik kopyalanır ve "İşlem Geçmişi"nde görünür.
+
+## ⚠️ Önemli Uyarı
+Bu yazılım eğitim ve araştırma amaçlıdır. Kripto para işlemleri yüksek risk içerir. Gerçek cüzdan ve anahtarlarınızı kullanmadan önce test ağlarında denemeniz önerilir.
+
+## 📄 Lisans
+Bu proje MIT Lisansı ile lisanslanmıştır.
