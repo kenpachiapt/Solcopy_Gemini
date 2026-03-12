@@ -280,7 +280,7 @@ async function startServer() {
   app.use(express.json());
 
   app.get("/api/wallets", (req, res) => {
-    console.log("GET /api/wallets");
+    console.log(">>> GET /api/wallets");
     const wallets = db.prepare("SELECT * FROM tracked_wallets").all();
     res.json(wallets);
   });
@@ -310,12 +310,13 @@ async function startServer() {
   });
 
   app.get("/api/trades", (req, res) => {
-    console.log("GET /api/trades");
+    console.log(">>> GET /api/trades");
     const trades = db.prepare("SELECT * FROM trades ORDER BY created_at DESC LIMIT 50").all();
     res.json(trades);
   });
 
   app.get("/api/balance", async (req, res) => {
+    console.log(">>> GET /api/balance");
     try {
       const currentConnection = getConnection();
       const settings = db.prepare("SELECT * FROM settings").all() as { key: string, value: string }[];
@@ -326,29 +327,33 @@ async function startServer() {
 
       const tradingKey = settingsMap.trading_keypair || process.env.PRIVATE_KEY || process.env.TRADING_KEYPAIR;
       if (!tradingKey) {
+        console.log(">>> Balance: Trading key not set");
         return res.json({ balance: 0, address: "Not Set" });
       }
 
       const keypair = Keypair.fromSecretKey(bs58.decode(tradingKey));
+      console.log(">>> Fetching balance for:", keypair.publicKey.toBase58());
       const balance = await currentConnection.getBalance(keypair.publicKey);
+      console.log(">>> Balance fetched:", balance);
       res.json({ 
         balance: balance / LAMPORTS_PER_SOL, 
         address: keypair.publicKey.toBase58() 
       });
     } catch (error) {
-      console.error("Failed to fetch balance:", error);
+      console.error(">>> Failed to fetch balance:", error);
       res.status(500).json({ error: "Failed to fetch balance" });
     }
   });
 
   app.get("/api/stats", (req, res) => {
-    console.log("GET /api/stats");
+    console.log(">>> GET /api/stats");
     const totalTrades = db.prepare("SELECT COUNT(*) as count FROM trades").get() as { count: number };
     const activePositions = db.prepare("SELECT COUNT(*) as count FROM positions WHERE is_active = 1").get() as { count: number };
     res.json({ totalTrades: totalTrades.count, activePositions: activePositions.count });
   });
 
   app.get("/api/settings", (req, res) => {
+    console.log(">>> GET /api/settings");
     const settings = db.prepare("SELECT * FROM settings").all();
     const settingsMap = settings.reduce((acc: any, curr: any) => {
       acc[curr.key] = curr.value;
