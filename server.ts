@@ -101,21 +101,35 @@ const sendTelegramMessage = async (message: string) => {
 // Wallet Monitoring Logic
 const activeSubscriptions: Map<string, number> = new Map();
 
+const stopMonitoring = () => {
+  console.log("🛑 Stopping all monitoring...");
+  for (const [address, subId] of activeSubscriptions.entries()) {
+    try {
+      connection.removeOnLogsListener(subId);
+    } catch (e) {
+      console.error(`Failed to remove listener for ${address}:`, e);
+    }
+  }
+  activeSubscriptions.clear();
+};
+
 const startMonitoring = async () => {
   const wallets = db.prepare("SELECT address FROM tracked_wallets WHERE is_active = 1").all() as { address: string }[];
+  
+  console.log(`🔄 Starting monitoring for ${wallets.length} wallets...`);
   
   for (const wallet of wallets) {
     if (!activeSubscriptions.has(wallet.address)) {
       try {
         const pubkey = new PublicKey(wallet.address);
         const subId = connection.onLogs(pubkey, async (logs, ctx) => {
-          console.log(`Activity detected on wallet: ${wallet.address}`);
+          console.log(`⚡ Activity detected on wallet: ${wallet.address} | Sig: ${logs.signature}`);
           await processTransaction(logs.signature, wallet.address);
         }, "confirmed");
         activeSubscriptions.set(wallet.address, subId);
-        console.log(`Monitoring started for: ${wallet.address}`);
+        console.log(`✅ Monitoring started for: ${wallet.address}`);
       } catch (error) {
-        console.error(`Failed to monitor ${wallet.address}:`, error);
+        console.error(`❌ Failed to monitor ${wallet.address}:`, error);
       }
     }
   }
@@ -143,17 +157,27 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     const postTokenBalances = originalTx.meta.postTokenBalances || [];
     const preTokenBalances = originalTx.meta.preTokenBalances || [];
     
-    const tokenChange = postTokenBalances.find((post: any) => {
+    console.log(`🔍 Analyzing token balances for ${walletAddress}...`);
+    const tokenChanges = postTokenBalances.filter((post: any) => {
       const pre = preTokenBalances.find((p: any) => p.accountIndex === post.accountIndex);
       return post.owner === walletAddress && (!pre || post.uiTokenAmount.amount !== pre.uiTokenAmount.amount);
     });
 
-    if (!tokenChange) return;
+    if (tokenChanges.length === 0) {
+      console.log("⚠️ No token balance changes found for this wallet. Skipping.");
+      return;
+    }
 
+    // Prefer the change that isn't a known stablecoin or common fee token if multiple exist
+    // For now, just take the first significant one
+    const tokenChange = tokenChanges[0];
     const tokenMint = tokenChange.mint;
-    const isBuy = new BigNumber(tokenChange.uiTokenAmount.amount).gt(
-      preTokenBalances.find((p: any) => p.accountIndex === tokenChange.accountIndex)?.uiTokenAmount.amount || 0
-    );
+    
+    const preAmount = preTokenBalances.find((p: any) => p.accountIndex === tokenChange.accountIndex)?.uiTokenAmount.amount || "0";
+    const postAmount = tokenChange.uiTokenAmount.amount;
+    
+    const isBuy = new BigNumber(postAmount).gt(preAmount);
+    console.log(`ℹ️ Detected ${isBuy ? "BUY" : "SELL"} for token: ${tokenMint}`);
 
     // Calculate Buy Amount
     let buyAmountSol = 0.1; // Default fallback
@@ -219,26 +243,53 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
 };
 
 const processTransaction = async (signature: string, walletAddress: string) => {
-  try {
-    const currentConnection = getConnection();
-    const tx = await currentConnection.getParsedTransaction(signature, {
-      maxSupportedTransactionVersion: 0,
-    });
+  console.log(`🔍 Processing transaction: ${signature} for wallet: ${walletAddress}`);
+  
+  let retries = 5;
+  let tx = null;
+  const currentConnection = getConnection();
 
-    if (!tx || !tx.meta) return;
-
-    const logs = tx.meta.logMessages || [];
-    const isSwap = logs.some(log => log.toLowerCase().includes("swap") || log.toLowerCase().includes("raydium") || log.toLowerCase().includes("pump"));
-
-    if (isSwap) {
-      const fee = tx.meta.fee / LAMPORTS_PER_SOL;
-      await sendTelegramMessage(`🚀 *New Swap Detected!*\nWallet: \`${walletAddress}\`\nTX: [View on Solscan](https://solscan.io/tx/${signature})\nFee: ${fee} SOL`);
-      
-      // Execute the copy trade
-      await executeCopyTrade(tx, walletAddress, currentConnection);
+  while (retries > 0 && !tx) {
+    try {
+      tx = await currentConnection.getParsedTransaction(signature, {
+        maxSupportedTransactionVersion: 0,
+        commitment: "confirmed"
+      });
+      if (!tx) {
+        console.log(`⏳ Transaction not yet indexed, retrying... (${retries} left)`);
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        retries--;
+      }
+    } catch (error) {
+      console.error("Error fetching transaction:", error);
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      retries--;
     }
-  } catch (error) {
-    console.error("Error processing transaction:", error);
+  }
+
+  if (!tx || !tx.meta) {
+    console.log(`❌ Failed to fetch transaction details for ${signature} after retries.`);
+    return;
+  }
+
+  const logs = tx.meta.logMessages || [];
+  const isSwap = logs.some(log => 
+    log.toLowerCase().includes("swap") || 
+    log.toLowerCase().includes("raydium") || 
+    log.toLowerCase().includes("pump") ||
+    log.toLowerCase().includes("jupiter") ||
+    log.toLowerCase().includes("whirlpool")
+  );
+
+  if (isSwap) {
+    console.log(`✅ Swap detected in ${signature}`);
+    const fee = tx.meta.fee / LAMPORTS_PER_SOL;
+    await sendTelegramMessage(`🚀 *New Swap Detected!*\nWallet: \`${walletAddress}\`\nTX: [View on Solscan](https://solscan.io/tx/${signature})\nFee: ${fee} SOL`);
+    
+    // Execute the copy trade
+    await executeCopyTrade(tx, walletAddress, currentConnection);
+  } else {
+    console.log(`ℹ️ Transaction ${signature} is not a recognized swap.`);
   }
 };
 
@@ -279,43 +330,65 @@ async function startServer() {
   // API Routes
   app.use(express.json());
 
-  app.get("/api/wallets", (req, res) => {
-    console.log(">>> GET /api/wallets");
-    const wallets = db.prepare("SELECT * FROM tracked_wallets").all();
-    res.json(wallets);
+  // Request Logger
+  app.use((req, res, next) => {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+    next();
   });
 
-  app.post("/api/wallets", (req, res) => {
-    console.log("POST /api/wallets", req.body);
+  app.get(["/api/wallets", "/api/wallets/"], (req, res) => {
+    console.log(">>> Handling GET /api/wallets");
+    try {
+      const wallets = db.prepare("SELECT * FROM tracked_wallets").all();
+      res.json(wallets);
+    } catch (error) {
+      console.error(">>> Error in GET /api/wallets:", error);
+      res.status(500).json({ error: "Internal Server Error" });
+    }
+  });
+
+  app.post(["/api/wallets", "/api/wallets/"], (req, res) => {
+    console.log(">>> Handling POST /api/wallets", req.body);
     const { address, label } = req.body;
     try {
       db.prepare("INSERT INTO tracked_wallets (address, label) VALUES (?, ?)").run(address, label);
       startMonitoring();
       res.json({ success: true });
     } catch (error) {
+      console.error(">>> Error in POST /api/wallets:", error);
       res.status(400).json({ error: "Wallet already exists or invalid data" });
     }
   });
 
-  app.delete("/api/wallets/:id", (req, res) => {
-    console.log("DELETE /api/wallets", req.params.id);
+  app.delete(["/api/wallets/:id", "/api/wallets/:id/"], (req, res) => {
+    console.log(">>> Handling DELETE /api/wallets", req.params.id);
     const { id } = req.params;
-    const wallet = db.prepare("SELECT address FROM tracked_wallets WHERE id = ?").get() as { address: string };
-    if (wallet && activeSubscriptions.has(wallet.address)) {
-      connection.removeOnLogsListener(activeSubscriptions.get(wallet.address)!);
-      activeSubscriptions.delete(wallet.address);
+    try {
+      const wallet = db.prepare("SELECT address FROM tracked_wallets WHERE id = ?").get() as { address: string };
+      if (wallet && activeSubscriptions.has(wallet.address)) {
+        connection.removeOnLogsListener(activeSubscriptions.get(wallet.address)!);
+        activeSubscriptions.delete(wallet.address);
+      }
+      db.prepare("DELETE FROM tracked_wallets WHERE id = ?").run(id);
+      res.json({ success: true });
+    } catch (error) {
+      console.error(">>> Error in DELETE /api/wallets:", error);
+      res.status(500).json({ error: "Internal Server Error" });
     }
-    db.prepare("DELETE FROM tracked_wallets WHERE id = ?").run(id);
-    res.json({ success: true });
   });
 
-  app.get("/api/trades", (req, res) => {
-    console.log(">>> GET /api/trades");
-    const trades = db.prepare("SELECT * FROM trades ORDER BY created_at DESC LIMIT 50").all();
-    res.json(trades);
+  app.get(["/api/trades", "/api/trades/"], (req, res) => {
+    console.log(">>> Handling GET /api/trades");
+    try {
+      const trades = db.prepare("SELECT * FROM trades ORDER BY created_at DESC LIMIT 50").all();
+      res.json(trades);
+    } catch (error) {
+      console.error(">>> Error in GET /api/trades:", error);
+      res.status(500).json({ error: "Internal Server Error" });
+    }
   });
 
-  app.get("/api/balance", async (req, res) => {
+  app.get(["/api/balance", "/api/balance/"], async (req, res) => {
     console.log(">>> GET /api/balance");
     try {
       const currentConnection = getConnection();
@@ -345,33 +418,64 @@ async function startServer() {
     }
   });
 
-  app.get("/api/stats", (req, res) => {
-    console.log(">>> GET /api/stats");
-    const totalTrades = db.prepare("SELECT COUNT(*) as count FROM trades").get() as { count: number };
-    const activePositions = db.prepare("SELECT COUNT(*) as count FROM positions WHERE is_active = 1").get() as { count: number };
-    res.json({ totalTrades: totalTrades.count, activePositions: activePositions.count });
+  app.get(["/api/stats", "/api/stats/"], (req, res) => {
+    console.log(">>> Handling GET /api/stats");
+    try {
+      const totalTrades = db.prepare("SELECT COUNT(*) as count FROM trades").get() as { count: number };
+      const activePositions = db.prepare("SELECT COUNT(*) as count FROM positions WHERE is_active = 1").get() as { count: number };
+      res.json({ totalTrades: totalTrades.count, activePositions: activePositions.count });
+    } catch (error) {
+      console.error(">>> Error in GET /api/stats:", error);
+      res.status(500).json({ error: "Internal Server Error" });
+    }
   });
 
-  app.get("/api/settings", (req, res) => {
-    console.log(">>> GET /api/settings");
-    const settings = db.prepare("SELECT * FROM settings").all();
-    const settingsMap = settings.reduce((acc: any, curr: any) => {
-      acc[curr.key] = curr.value;
-      return acc;
-    }, {});
-    res.json(settingsMap);
+  app.get(["/api/settings", "/api/settings/"], (req, res) => {
+    console.log(">>> Handling GET /api/settings");
+    try {
+      const settings = db.prepare("SELECT * FROM settings").all();
+      const settingsMap = settings.reduce((acc: any, curr: any) => {
+        acc[curr.key] = curr.value;
+        return acc;
+      }, {});
+      res.json(settingsMap);
+    } catch (error) {
+      console.error(">>> Error in GET /api/settings:", error);
+      res.status(500).json({ error: "Internal Server Error" });
+    }
   });
 
-  app.post("/api/settings", (req, res) => {
+  app.post(["/api/settings", "/api/settings/"], (req, res) => {
+    console.log(">>> Handling POST /api/settings", req.body);
     const settings = req.body;
-    const upsert = db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)");
-    const transaction = db.transaction((data) => {
-      for (const [key, value] of Object.entries(data)) {
-        upsert.run(key, String(value));
+    try {
+      const upsert = db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)");
+      const transaction = db.transaction((data) => {
+        for (const [key, value] of Object.entries(data)) {
+          upsert.run(key, String(value));
+        }
+      });
+      transaction(settings);
+
+      // If RPC changed, update connection and restart monitoring
+      if (settings.solana_rpc) {
+        console.log("🔄 RPC URL updated, restarting connection...");
+        stopMonitoring();
+        connection = getConnection();
+        startMonitoring();
       }
-    });
-    transaction(settings);
-    res.json({ success: true });
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error(">>> Error in POST /api/settings:", error);
+      res.status(500).json({ error: "Internal Server Error" });
+    }
+  });
+
+  // API 404 Handler
+  app.all("/api/*", (req, res) => {
+    console.log(`>>> API 404: ${req.method} ${req.url}`);
+    res.status(404).json({ error: "API Route Not Found" });
   });
 
   // Vite Integration
