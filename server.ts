@@ -220,8 +220,26 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     const amountInLamports = Math.floor(buyAmountSol * LAMPORTS_PER_SOL);
     console.log(`🎯 Copying ${isBuy ? "BUY" : "SELL"} for ${tokenMint} | Amount: ${buyAmountSol.toFixed(4)} SOL | Fee: ${priorityFee / LAMPORTS_PER_SOL} SOL | Slippage: ${slippageBps/100}%`);
 
-    // 3. Execute Swap via Jupiter API
-    const quoteResponse = await axios.get(`https://quote-api.jup.ag/v6/quote?inputMint=${isBuy ? "So11111111111111111111111111111111111111112" : tokenMint}&outputMint=${isBuy ? tokenMint : "So11111111111111111111111111111111111111112"}&amount=${amountInLamports}&slippageBps=${slippageBps}`);
+    // 3. Execute Swap via Jupiter API with retries
+    console.log(`📡 Fetching quote from Jupiter for ${tokenMint}...`);
+    let quoteResponse = null;
+    let jupRetries = 3;
+    
+    while (jupRetries > 0 && !quoteResponse) {
+      try {
+        const url = `https://quote-api.jup.ag/v6/quote?inputMint=${isBuy ? "So11111111111111111111111111111111111111112" : tokenMint}&outputMint=${isBuy ? tokenMint : "So11111111111111111111111111111111111111112"}&amount=${amountInLamports}&slippageBps=${slippageBps}`;
+        quoteResponse = await axios.get(url, { timeout: 10000 });
+      } catch (err) {
+        jupRetries--;
+        console.error(`⚠️ Jupiter API attempt failed (${jupRetries} retries left):`, err instanceof Error ? err.message : err);
+        if (jupRetries > 0) await new Promise(resolve => setTimeout(resolve, 2000));
+        else throw err;
+      }
+    }
+
+    if (!quoteResponse || !quoteResponse.data) {
+      throw new Error("Failed to get a valid quote from Jupiter");
+    }
     
     // Record the trade in DB
     db.prepare("INSERT INTO trades (wallet_address, token_mint, side, amount_sol, status, tx_hash, fee) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
