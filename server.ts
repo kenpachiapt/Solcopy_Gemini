@@ -396,12 +396,25 @@ apiRouter.post("/wallets", (req, res) => {
   }
 });
 
+apiRouter.put("/wallets/:id", (req, res) => {
+  const { id } = req.params;
+  const { label } = req.body;
+  try {
+    db.prepare("UPDATE tracked_wallets SET label = ? WHERE id = ?").run(label, id);
+    res.json({ success: true });
+  } catch (error) {
+    console.error(">>> Error in PUT /api/wallets:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
 apiRouter.delete("/wallets/:id", (req, res) => {
   console.log(">>> Handling DELETE /api/wallets", req.params.id);
   const { id } = req.params;
   try {
-    const wallet = db.prepare("SELECT address FROM tracked_wallets WHERE id = ?").get() as { address: string };
+    const wallet = db.prepare("SELECT address FROM tracked_wallets WHERE id = ?").get(id) as { address: string };
     if (wallet && activeSubscriptions.has(wallet.address)) {
+      const connection = getConnection();
       connection.removeOnLogsListener(activeSubscriptions.get(wallet.address)!);
       activeSubscriptions.delete(wallet.address);
     }

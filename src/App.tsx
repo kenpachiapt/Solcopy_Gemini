@@ -79,6 +79,7 @@ export default function App() {
   const [stats, setStats] = useState({ totalTrades: 0, activePositions: 0, totalVolumeSol: 0, netProfitSol: 0, solPrice: 150 });
   const [walletBalance, setWalletBalance] = useState({ balance: 0, address: "" });
   const [newWallet, setNewWallet] = useState({ address: "", label: "" });
+  const [editingWallet, setEditingWallet] = useState<{ id: number, label: string } | null>(null);
   const [loading, setLoading] = useState(false);
   const [solPrice, setSolPrice] = useState(150);
   const [settings, setSettings] = useState({
@@ -178,11 +179,26 @@ export default function App() {
   };
 
   const deleteWallet = async (id: number) => {
+    if (!confirm("Bu cüzdanı takipten çıkarmak istediğinize emin misiniz?")) return;
     try {
       await fetch(`/api/wallets/${id}`, { method: "DELETE" });
       fetchData();
     } catch (error) {
       console.error("Failed to delete wallet:", error);
+    }
+  };
+
+  const updateWallet = async (id: number, label: string) => {
+    try {
+      await fetch(`/api/wallets/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ label })
+      });
+      setEditingWallet(null);
+      fetchData();
+    } catch (error) {
+      console.error("Failed to update wallet:", error);
     }
   };
 
@@ -540,12 +556,47 @@ export default function App() {
                           {w.label?.[0] || "W"}
                         </div>
                         <div className="flex gap-2">
-                          <button className="p-2 hover:bg-white/5 rounded-lg text-gray-500"><Settings className="w-4 h-4" /></button>
-                          <button onClick={() => deleteWallet(w.id)} className="p-2 hover:bg-red-400/10 rounded-lg text-gray-500 hover:text-red-400"><Trash2 className="w-4 h-4" /></button>
+                          <button 
+                            onClick={() => setEditingWallet({ id: w.id, label: w.label || "" })}
+                            className="p-2 hover:bg-white/5 rounded-lg text-gray-500 hover:text-[#14F195] transition-colors"
+                          >
+                            <Settings className="w-4 h-4" />
+                          </button>
+                          <button onClick={() => deleteWallet(w.id)} className="p-2 hover:bg-red-400/10 rounded-lg text-gray-500 hover:text-red-400 transition-colors">
+                            <Trash2 className="w-4 h-4" />
+                          </button>
                         </div>
                       </div>
-                      <h3 className="font-bold text-lg mb-1">{w.label || "İsimsiz Cüzdan"}</h3>
-                      <code className="text-[10px] text-gray-500 font-mono block mb-6">{w.address}</code>
+                      {editingWallet?.id === w.id ? (
+                        <div className="space-y-3 mb-6">
+                          <input 
+                            type="text" 
+                            className="w-full bg-black/40 border border-[#14F195]/30 rounded-lg px-3 py-2 text-xs focus:outline-none focus:border-[#14F195]"
+                            value={editingWallet.label}
+                            onChange={(e) => setEditingWallet({ ...editingWallet, label: e.target.value })}
+                            autoFocus
+                          />
+                          <div className="flex gap-2">
+                            <button 
+                              onClick={() => updateWallet(w.id, editingWallet.label)}
+                              className="flex-1 bg-[#14F195] text-black font-bold py-1.5 rounded-lg text-[10px]"
+                            >
+                              KAYDET
+                            </button>
+                            <button 
+                              onClick={() => setEditingWallet(null)}
+                              className="flex-1 bg-white/5 text-gray-400 font-bold py-1.5 rounded-lg text-[10px]"
+                            >
+                              İPTAL
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <>
+                          <h3 className="font-bold text-lg mb-1">{w.label || "İsimsiz Cüzdan"}</h3>
+                          <code className="text-[10px] text-gray-500 font-mono block mb-6">{w.address}</code>
+                        </>
+                      )}
                       
                       <div className="grid grid-cols-2 gap-4 pt-4 border-t border-white/5">
                         <div>
