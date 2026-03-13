@@ -1,6 +1,6 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
-import { Connection, PublicKey, Keypair, Transaction, SystemProgram, LAMPORTS_PER_SOL } from "@solana/web3.js";
+import { Connection, PublicKey, Keypair, Transaction, SystemProgram, LAMPORTS_PER_SOL, VersionedTransaction } from "@solana/web3.js";
 import { Telegraf } from "telegraf";
 import Database from "better-sqlite3";
 import axios from "axios";
@@ -114,10 +114,33 @@ const stopMonitoring = () => {
 };
 
 const startMonitoring = async () => {
+  // Check global bot status
+  const botStatus = db.prepare("SELECT value FROM settings WHERE key = 'bot_enabled'").get() as { value: string } | undefined;
+  const isBotEnabled = botStatus ? botStatus.value === "true" : true; // Default to true
+
+  if (!isBotEnabled) {
+    console.log("ℹ️ Bot is globally disabled. Stopping all monitoring.");
+    stopMonitoring();
+    return;
+  }
+
   const wallets = db.prepare("SELECT address FROM tracked_wallets WHERE is_active = 1").all() as { address: string }[];
-  
-  console.log(`🔄 Starting monitoring for ${wallets.length} wallets...`);
-  
+  const activeAddresses = new Set(wallets.map(w => w.address));
+
+  // Stop monitoring for wallets that are no longer active or removed
+  for (const [address, subId] of activeSubscriptions.entries()) {
+    if (!activeAddresses.has(address)) {
+      try {
+        connection.removeOnLogsListener(subId);
+        activeSubscriptions.delete(address);
+        console.log(`🛑 Stopped monitoring for: ${address}`);
+      } catch (e) {
+        console.error(`Failed to remove listener for ${address}:`, e);
+      }
+    }
+  }
+
+  // Start monitoring for new active wallets
   for (const wallet of wallets) {
     if (!activeSubscriptions.has(wallet.address)) {
       try {
@@ -254,6 +277,46 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
       throw new Error(`Failed to get a valid quote from any Jupiter endpoint. Last error: ${lastError}`);
     }
     
+    console.log(`📦 Requesting swap transaction from Jupiter...`);
+    const swapResponse = await axios.post("https://quote-api.jup.ag/v6/swap", {
+      quoteResponse: quoteResponse.data,
+      userPublicKey: keypair.publicKey.toString(),
+      wrapAndUnwrapSol: true,
+      prioritizationFeeLamports: Math.floor(priorityFee)
+    }, { timeout: 10000 });
+
+    if (!swapResponse.data || !swapResponse.data.swapTransaction) {
+      throw new Error("Failed to get swap transaction from Jupiter");
+    }
+
+    const { swapTransaction } = swapResponse.data;
+    
+    // Deserialize and sign
+    const swapTransactionBuf = Buffer.from(swapTransaction, 'base64');
+    const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+    
+    // Get latest blockhash for the transaction
+    const { blockhash } = await currentConnection.getLatestBlockhash();
+    transaction.message.recentBlockhash = blockhash;
+    
+    transaction.sign([keypair]);
+    
+    console.log(`🚀 Sending transaction to blockchain...`);
+    const txid = await currentConnection.sendRawTransaction(transaction.serialize(), {
+      skipPreflight: true,
+      maxRetries: 3
+    });
+    
+    console.log(`⏳ Waiting for confirmation: ${txid}`);
+    const latestBlockHash = await currentConnection.getLatestBlockhash();
+    await currentConnection.confirmTransaction({
+      blockhash: latestBlockHash.blockhash,
+      lastValidBlockHeight: latestBlockHash.lastValidBlockHeight,
+      signature: txid
+    }, 'confirmed');
+
+    console.log(`✅ Transaction confirmed: ${txid}`);
+
     // Record the trade in DB
     db.prepare("INSERT INTO trades (wallet_address, token_mint, side, amount_sol, status, tx_hash, fee) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
       walletAddress,
@@ -261,11 +324,11 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
       isBuy ? "buy" : "sell",
       buyAmountSol,
       "completed",
-      `copy_${Date.now()}`,
+      txid,
       priorityFee / LAMPORTS_PER_SOL
     );
 
-    await sendTelegramMessage(`✅ *Trade Copied!*\nToken: \`${tokenMint}\`\nSide: ${isBuy ? "BUY" : "SELL"}\nAmount: ${buyAmountSol.toFixed(4)} SOL\nFee: ${priorityFee / LAMPORTS_PER_SOL} SOL`);
+    await sendTelegramMessage(`✅ *Trade Executed!*\nToken: \`${tokenMint}\`\nSide: ${isBuy ? "BUY" : "SELL"}\nAmount: ${buyAmountSol.toFixed(4)} SOL\nTX: [View on Solscan](https://solscan.io/tx/${txid})`);
 
   } catch (error) {
     console.error("Copy trade execution failed:", error);
@@ -310,16 +373,26 @@ const processTransaction = async (signature: string, walletAddress: string) => {
   }
 
   const logs = tx.meta.logMessages || [];
-  const isSwap = logs.some(log => 
-    log.toLowerCase().includes("swap") || 
-    log.toLowerCase().includes("raydium") || 
-    log.toLowerCase().includes("pump") ||
-    log.toLowerCase().includes("jupiter") ||
-    log.toLowerCase().includes("whirlpool")
-  );
+  const isSwap = logs.some(log => {
+    const l = log.toLowerCase();
+    return l.includes("swap") || 
+           l.includes("raydium") || 
+           l.includes("pump") ||
+           l.includes("jupiter") ||
+           l.includes("whirlpool") ||
+           l.includes("meteora") ||
+           l.includes("orca") ||
+           l.includes("lifinity") ||
+           l.includes("fluxbeam") ||
+           l.includes("phoenix") ||
+           l.includes("openbook");
+  });
 
-  if (isSwap) {
-    console.log(`✅ Swap detected in ${signature}`);
+  // Fallback: Check if there are token balance changes for the wallet
+  const hasTokenChange = (tx.meta.postTokenBalances || []).some((b: any) => b.owner === walletAddress);
+
+  if (isSwap || hasTokenChange) {
+    console.log(`✅ Swap/Activity detected in ${signature}`);
     const fee = tx.meta.fee / LAMPORTS_PER_SOL;
     await sendTelegramMessage(`🚀 *New Swap Detected!*\nWallet: \`${walletAddress}\`\nTX: [View on Solscan](https://solscan.io/tx/${signature})\nFee: ${fee} SOL`);
     
@@ -404,6 +477,18 @@ apiRouter.put("/wallets/:id", (req, res) => {
     res.json({ success: true });
   } catch (error) {
     console.error(">>> Error in PUT /api/wallets:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+apiRouter.put("/wallets/:id/toggle", (req, res) => {
+  const { id } = req.params;
+  try {
+    db.prepare("UPDATE tracked_wallets SET is_active = 1 - is_active WHERE id = ?").run(id);
+    startMonitoring();
+    res.json({ success: true });
+  } catch (error) {
+    console.error(">>> Error in PUT /api/wallets/toggle:", error);
     res.status(500).json({ error: "Internal Server Error" });
   }
 });
@@ -542,6 +627,19 @@ apiRouter.get("/stats", async (req, res) => {
     });
   } catch (error) {
     console.error(">>> Error in GET /api/stats:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+apiRouter.post("/settings/toggle-bot", (req, res) => {
+  try {
+    const current = db.prepare("SELECT value FROM settings WHERE key = 'bot_enabled'").get() as { value: string } | undefined;
+    const newValue = current ? (current.value === "true" ? "false" : "true") : "false";
+    db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('bot_enabled', ?)").run(newValue);
+    startMonitoring();
+    res.json({ success: true, enabled: newValue === "true" });
+  } catch (error) {
+    console.error(">>> Error in POST /api/settings/toggle-bot:", error);
     res.status(500).json({ error: "Internal Server Error" });
   }
 });

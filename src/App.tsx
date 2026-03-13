@@ -17,6 +17,7 @@ import {
   Target,
   BarChart3,
   Cpu,
+  Power,
   Lock,
   ChevronRight,
   MoreVertical,
@@ -82,6 +83,7 @@ export default function App() {
   const [editingWallet, setEditingWallet] = useState<{ id: number, label: string } | null>(null);
   const [loading, setLoading] = useState(false);
   const [solPrice, setSolPrice] = useState(150);
+  const [botEnabled, setBotEnabled] = useState(true);
   const [settings, setSettings] = useState({
     buy_amount: "0.1",
     max_slippage: "",
@@ -105,6 +107,7 @@ export default function App() {
         { name: "settings", url: "/api/settings", setter: (data: any) => {
           if (Object.keys(data).length > 0) {
             setSettings(prev => ({ ...prev, ...data }));
+            if (data.bot_enabled !== undefined) setBotEnabled(data.bot_enabled === "true");
           }
         }},
         { name: "balance", url: "/api/balance", setter: setWalletBalance }
@@ -199,6 +202,27 @@ export default function App() {
       fetchData();
     } catch (error) {
       console.error("Failed to update wallet:", error);
+    }
+  };
+
+  const toggleWallet = async (id: number) => {
+    try {
+      await fetch(`/api/wallets/${id}/toggle`, { method: "PUT" });
+      fetchData();
+    } catch (error) {
+      console.error("Failed to toggle wallet:", error);
+    }
+  };
+
+  const toggleBot = async () => {
+    try {
+      const res = await fetch("/api/settings/toggle-bot", { method: "POST" });
+      if (res.ok) {
+        const data = await res.json();
+        setBotEnabled(data.enabled);
+      }
+    } catch (error) {
+      console.error("Failed to toggle bot:", error);
     }
   };
 
@@ -306,6 +330,17 @@ export default function App() {
               <div className="w-2 h-2 rounded-full bg-[#9945FF]" />
               <span className="text-[10px] lg:text-xs font-mono text-gray-300">{walletBalance.balance.toFixed(2)} SOL</span>
             </div>
+            <button 
+              onClick={toggleBot}
+              className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold transition-all ${
+                botEnabled 
+                  ? "bg-[#14F195]/20 text-[#14F195] border border-[#14F195]/30" 
+                  : "bg-red-400/20 text-red-400 border border-red-400/30"
+              }`}
+            >
+              <Power className="w-3 h-3" />
+              {botEnabled ? "BOT AKTİF" : "BOT DURDURULDU"}
+            </button>
             <button className="p-2 hover:bg-white/5 rounded-lg transition-colors relative">
               <Bell className="w-5 h-5 text-gray-400" />
               <span className="absolute top-1.5 right-1.5 w-2 h-2 bg-[#9945FF] rounded-full border-2 border-[#0A0A0B]" />
@@ -556,6 +591,13 @@ export default function App() {
                           {w.label?.[0] || "W"}
                         </div>
                         <div className="flex gap-2">
+                          <button 
+                            onClick={() => toggleWallet(w.id)}
+                            className={`p-2 rounded-lg transition-colors ${w.is_active ? 'text-[#14F195] hover:bg-[#14F195]/10' : 'text-gray-500 hover:bg-white/5'}`}
+                            title={w.is_active ? "Durdur" : "Başlat"}
+                          >
+                            <Power className="w-4 h-4" />
+                          </button>
                           <button 
                             onClick={() => setEditingWallet({ id: w.id, label: w.label || "" })}
                             className="p-2 hover:bg-white/5 rounded-lg text-gray-500 hover:text-[#14F195] transition-colors"
