@@ -220,25 +220,39 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     const amountInLamports = Math.floor(buyAmountSol * LAMPORTS_PER_SOL);
     console.log(`🎯 Copying ${isBuy ? "BUY" : "SELL"} for ${tokenMint} | Amount: ${buyAmountSol.toFixed(4)} SOL | Fee: ${priorityFee / LAMPORTS_PER_SOL} SOL | Slippage: ${slippageBps/100}%`);
 
-    // 3. Execute Swap via Jupiter API with retries
-    console.log(`📡 Fetching quote from Jupiter for ${tokenMint}...`);
+    // 3. Execute Swap via Jupiter API with retries and fallbacks
+    const customJupUrl = settingsMap.jupiter_api_url;
+    const endpoints = [
+      customJupUrl,
+      "https://quote-api.jup.ag/v6/quote",
+      "https://api.jup.ag/v6/quote",
+      "https://public.jupiterapi.com/quote"
+    ].filter(Boolean) as string[];
+
+    console.log(`📡 Fetching quote from Jupiter...`);
     let quoteResponse = null;
-    let jupRetries = 3;
+    let lastError = "";
     
-    while (jupRetries > 0 && !quoteResponse) {
-      try {
-        const url = `https://quote-api.jup.ag/v6/quote?inputMint=${isBuy ? "So11111111111111111111111111111111111111112" : tokenMint}&outputMint=${isBuy ? tokenMint : "So11111111111111111111111111111111111111112"}&amount=${amountInLamports}&slippageBps=${slippageBps}`;
-        quoteResponse = await axios.get(url, { timeout: 10000 });
-      } catch (err) {
-        jupRetries--;
-        console.error(`⚠️ Jupiter API attempt failed (${jupRetries} retries left):`, err instanceof Error ? err.message : err);
-        if (jupRetries > 0) await new Promise(resolve => setTimeout(resolve, 2000));
-        else throw err;
+    for (const baseUrl of endpoints) {
+      let jupRetries = 2;
+      while (jupRetries > 0 && !quoteResponse) {
+        try {
+          const url = `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}inputMint=${isBuy ? "So11111111111111111111111111111111111111112" : tokenMint}&outputMint=${isBuy ? tokenMint : "So11111111111111111111111111111111111111112"}&amount=${amountInLamports}&slippageBps=${slippageBps}`;
+          console.log(`🔗 Trying Jupiter endpoint: ${baseUrl}`);
+          quoteResponse = await axios.get(url, { timeout: 8000 });
+          console.log("✅ Quote received successfully!");
+        } catch (err: any) {
+          jupRetries--;
+          lastError = err.message;
+          console.error(`⚠️ Jupiter attempt failed for ${baseUrl} (${jupRetries} retries left):`, lastError);
+          if (jupRetries > 0) await new Promise(resolve => setTimeout(resolve, 1500));
+        }
       }
+      if (quoteResponse) break;
     }
 
     if (!quoteResponse || !quoteResponse.data) {
-      throw new Error("Failed to get a valid quote from Jupiter");
+      throw new Error(`Failed to get a valid quote from any Jupiter endpoint. Last error: ${lastError}`);
     }
     
     // Record the trade in DB
