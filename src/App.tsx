@@ -76,11 +76,11 @@ export default function App() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [wallets, setWallets] = useState<TrackedWallet[]>([]);
   const [trades, setTrades] = useState<Trade[]>([]);
-  const [stats, setStats] = useState({ totalTrades: 0, activePositions: 0 });
+  const [stats, setStats] = useState({ totalTrades: 0, activePositions: 0, totalVolumeSol: 0, netProfitSol: 0, solPrice: 150 });
   const [walletBalance, setWalletBalance] = useState({ balance: 0, address: "" });
   const [newWallet, setNewWallet] = useState({ address: "", label: "" });
   const [loading, setLoading] = useState(false);
-  const [solPrice, setSolPrice] = useState(154.24);
+  const [solPrice, setSolPrice] = useState(150);
   const [settings, setSettings] = useState({
     buy_amount: "0.1",
     max_slippage: "",
@@ -97,7 +97,10 @@ export default function App() {
       const endpoints = [
         { name: "wallets", url: "/api/wallets", setter: setWallets },
         { name: "trades", url: "/api/trades", setter: setTrades },
-        { name: "stats", url: "/api/stats", setter: setStats },
+        { name: "stats", url: "/api/stats", setter: (data: any) => {
+          setStats(data);
+          if (data.solPrice) setSolPrice(data.solPrice);
+        }},
         { name: "settings", url: "/api/settings", setter: (data: any) => {
           if (Object.keys(data).length > 0) {
             setSettings(prev => ({ ...prev, ...data }));
@@ -112,11 +115,16 @@ export default function App() {
           if (!res.ok) {
             throw new Error(`HTTP error! status: ${res.status}`);
           }
+          const contentType = res.headers.get("content-type");
+          if (!contentType || !contentType.includes("application/json")) {
+            const text = await res.text();
+            console.error(`Expected JSON from ${ep.url} but got ${contentType}:`, text.slice(0, 100));
+            throw new Error(`Received non-JSON response from ${ep.name}`);
+          }
           const data = await res.json();
           ep.setter(data);
         } catch (err) {
           console.error(`Failed to fetch ${ep.name}:`, err);
-          // Don't rethrow, so other fetches can still succeed
         }
       }));
     } catch (error) {
@@ -303,17 +311,17 @@ export default function App() {
                 {/* Hero Stats */}
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-4 lg:gap-6">
                   {[
-                    { label: "Toplam Hacim", value: "$1.2M", change: "+12%", icon: TrendingUp, color: "text-[#14F195]" },
+                    { label: "Toplam Hacim", value: `${stats.totalVolumeSol.toFixed(2)} SOL`, change: `$${(stats.totalVolumeSol * solPrice).toLocaleString()}`, icon: TrendingUp, color: "text-[#14F195]" },
                     { label: "Kopya İşlemler", value: stats.totalTrades, change: "+5", icon: Activity, color: "text-[#9945FF]" },
-                    { label: "Aktif Botlar", value: wallets.length, change: "Canlı", icon: Cpu, color: "text-blue-400" },
-                    { label: "Net Kar", value: "+14.2 SOL", change: "+2.1%", icon: BarChart3, color: "text-[#14F195]" },
+                    { label: "Takip Edilenler", value: wallets.length, change: "Canlı", icon: Cpu, color: "text-blue-400" },
+                    { label: "Net Kar", value: `${stats.netProfitSol >= 0 ? '+' : ''}${stats.netProfitSol.toFixed(2)} SOL`, change: `$${(stats.netProfitSol * solPrice).toLocaleString()}`, icon: BarChart3, color: stats.netProfitSol >= 0 ? "text-[#14F195]" : "text-red-400" },
                   ].map((stat, i) => (
                     <div key={i} className="glass-card p-4 lg:p-6 rounded-2xl stat-card-gradient">
                       <div className="flex items-center justify-between mb-4">
                         <div className={`p-2 rounded-lg bg-white/5 ${stat.color}`}>
                           <stat.icon className="w-4 h-4" />
                         </div>
-                        <span className={`text-[10px] font-bold ${stat.change.startsWith('+') ? 'text-[#14F195]' : 'text-gray-500'}`}>
+                        <span className={`text-[10px] font-bold ${typeof stat.change === 'string' && stat.change.startsWith('+') ? 'text-[#14F195]' : 'text-gray-500'}`}>
                           {stat.change}
                         </span>
                       </div>
@@ -398,6 +406,13 @@ export default function App() {
                           className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-xs font-mono focus:outline-none focus:border-[#14F195]/50 transition-colors"
                           value={newWallet.address}
                           onChange={(e) => setNewWallet({ ...newWallet, address: e.target.value })}
+                        />
+                        <input 
+                          type="text" 
+                          placeholder="Cüzdan İsmi (Örn: Balina 1)" 
+                          className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-xs focus:outline-none focus:border-[#14F195]/50 transition-colors"
+                          value={newWallet.label}
+                          onChange={(e) => setNewWallet({ ...newWallet, label: e.target.value })}
                         />
                         <button className="w-full solana-gradient text-black font-bold py-3 rounded-xl text-xs flex items-center justify-center gap-2 hover:opacity-90 transition-opacity">
                           <Plus className="w-4 h-4" />
@@ -548,6 +563,154 @@ export default function App() {
               </motion.div>
             )}
 
+            {activeTab === "trades" && (
+              <motion.div
+                key="trades"
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -20 }}
+                className="space-y-6"
+              >
+                <div className="flex items-center justify-between mb-8">
+                  <h2 className="text-2xl font-bold">İşlem Geçmişi</h2>
+                  <div className="flex gap-4">
+                    <div className="relative">
+                      <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
+                      <input type="text" placeholder="Token ara..." className="bg-white/5 border border-white/10 rounded-xl pl-10 pr-4 py-2 text-xs focus:outline-none focus:border-[#14F195]/50" />
+                    </div>
+                    <button className="p-2 bg-white/5 rounded-xl hover:bg-white/10 transition-colors">
+                      <RefreshCw className="w-4 h-4 text-gray-400" />
+                    </button>
+                  </div>
+                </div>
+                <div className="glass-card rounded-2xl overflow-hidden">
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse">
+                      <thead>
+                        <tr className="bg-white/2">
+                          <th className="px-6 py-4 text-[10px] font-bold text-gray-500 uppercase tracking-widest">Zaman</th>
+                          <th className="px-6 py-4 text-[10px] font-bold text-gray-500 uppercase tracking-widest">Cüzdan</th>
+                          <th className="px-6 py-4 text-[10px] font-bold text-gray-500 uppercase tracking-widest">İşlem</th>
+                          <th className="px-6 py-4 text-[10px] font-bold text-gray-500 uppercase tracking-widest">Token</th>
+                          <th className="px-6 py-4 text-[10px] font-bold text-gray-500 uppercase tracking-widest">Miktar</th>
+                          <th className="px-6 py-4 text-[10px] font-bold text-gray-500 uppercase tracking-widest">Durum</th>
+                          <th className="px-6 py-4 text-[10px] font-bold text-gray-500 uppercase tracking-widest">TX</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-white/5">
+                        {trades.map((trade) => (
+                          <tr key={trade.id} className="hover:bg-white/2 transition-colors">
+                            <td className="px-6 py-4">
+                              <span className="text-[10px] text-gray-400 font-mono">
+                                {new Date(trade.created_at).toLocaleString()}
+                              </span>
+                            </td>
+                            <td className="px-6 py-4">
+                              <span className="text-[10px] text-gray-400 font-mono">{trade.wallet_address.slice(0, 4)}...{trade.wallet_address.slice(-4)}</span>
+                            </td>
+                            <td className="px-6 py-4">
+                              <span className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded ${
+                                trade.side === 'buy' ? 'bg-[#14F195]/10 text-[#14F195]' : 'bg-red-400/10 text-red-400'
+                              }`}>
+                                {trade.side === 'buy' ? 'AL' : 'SAT'}
+                              </span>
+                            </td>
+                            <td className="px-6 py-4">
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs font-bold font-mono">{trade.token_mint.slice(0, 4)}...{trade.token_mint.slice(-4)}</span>
+                              </div>
+                            </td>
+                            <td className="px-6 py-4">
+                              <span className="text-xs font-bold font-mono">{trade.amount_sol} SOL</span>
+                            </td>
+                            <td className="px-6 py-4">
+                              <span className="text-[10px] font-bold uppercase text-gray-400">{trade.status}</span>
+                            </td>
+                            <td className="px-6 py-4">
+                              <a href={`https://solscan.io/tx/${trade.tx_hash}`} target="_blank" className="text-gray-500 hover:text-[#14F195]">
+                                <ExternalLink className="w-4 h-4" />
+                              </a>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </motion.div>
+            )}
+
+            {activeTab === "targets" && (
+              <motion.div
+                key="targets"
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -20 }}
+                className="space-y-6"
+              >
+                <div className="flex items-center justify-between mb-8">
+                  <h2 className="text-2xl font-bold">Kopyalama Hedefleri</h2>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                  {wallets.map(w => (
+                    <div key={w.id} className="glass-card p-6 rounded-2xl">
+                      <div className="flex items-center justify-between mb-4">
+                        <div className="w-10 h-10 rounded-xl bg-white/5 flex items-center justify-center font-bold text-[#14F195]">
+                          {w.label?.[0] || "W"}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <div className="w-2 h-2 rounded-full bg-[#14F195] animate-pulse" />
+                          <span className="text-[10px] font-bold text-[#14F195]">AKTİF</span>
+                        </div>
+                      </div>
+                      <h3 className="font-bold mb-1">{w.label || "İsimsiz"}</h3>
+                      <p className="text-[10px] font-mono text-gray-500 mb-4">{w.address}</p>
+                      <div className="space-y-2">
+                        <div className="flex justify-between text-[10px]">
+                          <span className="text-gray-500">Kopyalama Oranı</span>
+                          <span className="text-gray-300">100%</span>
+                        </div>
+                        <div className="w-full h-1 bg-white/5 rounded-full overflow-hidden">
+                          <div className="w-full h-full bg-[#14F195]" />
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </motion.div>
+            )}
+
+            {activeTab === "analytics" && (
+              <motion.div
+                key="analytics"
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -20 }}
+                className="space-y-6"
+              >
+                <h2 className="text-2xl font-bold mb-8">Analizler</h2>
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                  <div className="glass-card p-6 rounded-2xl">
+                    <h3 className="text-xs font-bold uppercase tracking-widest mb-6">Kar/Zarar Dağılımı</h3>
+                    <div className="h-64 flex items-center justify-center text-gray-500 italic text-sm">
+                      Veri toplanıyor...
+                    </div>
+                  </div>
+                  <div className="glass-card p-6 rounded-2xl">
+                    <h3 className="text-xs font-bold uppercase tracking-widest mb-6">En Çok İşlem Yapılan Tokenlar</h3>
+                    <div className="space-y-4">
+                      {trades.slice(0, 5).map((t, i) => (
+                        <div key={i} className="flex items-center justify-between p-3 bg-white/5 rounded-xl">
+                          <span className="text-xs font-mono">{t.token_mint.slice(0, 8)}...</span>
+                          <span className="text-xs font-bold text-[#14F195]">{t.amount_sol.toFixed(2)} SOL</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </motion.div>
+            )}
+
             {activeTab === "settings" && (
               <motion.div
                 key="settings"
@@ -692,7 +855,7 @@ export default function App() {
         </div>
 
         {/* Floating Live Feed (Desktop Only) */}
-        <div className="hidden xl:block absolute right-8 top-24 w-64 space-y-4">
+        <div className="hidden 2xl:block absolute right-8 top-24 w-64 space-y-4">
           <div className="glass-card p-4 rounded-2xl">
             <h3 className="text-[10px] font-bold uppercase tracking-widest text-gray-500 mb-4 flex items-center gap-2">
               <Activity className="w-3 h-3 text-[#14F195]" />

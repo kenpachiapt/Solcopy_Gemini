@@ -224,9 +224,8 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     const customJupUrl = settingsMap.jupiter_api_url;
     const endpoints = [
       customJupUrl,
-      "https://public.jupiterapi.com/v6/quote", // Prioritize the public gateway with v6 path
-      "https://quote-api.jup.ag/v6/quote",
-      "https://api.jup.ag/v6/quote"
+      "https://public.jupiterapi.com/v6/quote", // Prioritize the public gateway
+      "https://quote-api.jup.ag/v6/quote"
     ].filter(Boolean) as string[];
 
     console.log(`📡 Fetching quote from Jupiter...`);
@@ -274,33 +273,39 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
   }
 };
 
+const withRpcRetry = async <T>(fn: () => Promise<T>, retries = 3, delay = 2000): Promise<T> => {
+  let lastError: any;
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      console.warn(`⚠️ RPC attempt ${i + 1} failed:`, error instanceof Error ? error.message : String(error));
+      if (i < retries - 1) await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  throw lastError;
+};
+
 const processTransaction = async (signature: string, walletAddress: string) => {
   console.log(`🔍 Processing transaction: ${signature} for wallet: ${walletAddress}`);
   
-  let retries = 5;
   let tx = null;
   const currentConnection = getConnection();
 
-  while (retries > 0 && !tx) {
-    try {
-      tx = await currentConnection.getParsedTransaction(signature, {
+  try {
+    tx = await withRpcRetry(async () => {
+      const result = await currentConnection.getParsedTransaction(signature, {
         maxSupportedTransactionVersion: 0,
         commitment: "confirmed"
       });
-      if (!tx) {
-        console.log(`⏳ Transaction not yet indexed, retrying... (${retries} left)`);
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        retries--;
+      if (!result) {
+        throw new Error("Transaction not yet indexed");
       }
-    } catch (error) {
-      console.error("Error fetching transaction:", error);
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      retries--;
-    }
-  }
-
-  if (!tx || !tx.meta) {
-    console.log(`❌ Failed to fetch transaction details for ${signature} after retries.`);
+      return result;
+    }, 5, 3000);
+  } catch (error) {
+    console.error(`❌ Failed to fetch transaction details for ${signature} after retries:`, error);
     return;
   }
 
@@ -357,158 +362,229 @@ const getTokenPrice = async (mint: string): Promise<number> => {
   return Math.random() * 10; 
 };
 
+// API Router
+const apiRouter = express.Router();
+apiRouter.use(express.json());
+
+// Request Logger for API
+apiRouter.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] API ${req.method} ${req.url}`);
+  next();
+});
+
+apiRouter.get("/wallets", (req, res) => {
+  console.log(">>> Handling GET /api/wallets");
+  try {
+    const wallets = db.prepare("SELECT * FROM tracked_wallets").all();
+    res.json(wallets);
+  } catch (error) {
+    console.error(">>> Error in GET /api/wallets:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+apiRouter.post("/wallets", (req, res) => {
+  console.log(">>> Handling POST /api/wallets", req.body);
+  const { address, label } = req.body;
+  try {
+    db.prepare("INSERT INTO tracked_wallets (address, label) VALUES (?, ?)").run(address, label);
+    startMonitoring();
+    res.json({ success: true });
+  } catch (error) {
+    console.error(">>> Error in POST /api/wallets:", error);
+    res.status(400).json({ error: "Wallet already exists or invalid data" });
+  }
+});
+
+apiRouter.delete("/wallets/:id", (req, res) => {
+  console.log(">>> Handling DELETE /api/wallets", req.params.id);
+  const { id } = req.params;
+  try {
+    const wallet = db.prepare("SELECT address FROM tracked_wallets WHERE id = ?").get() as { address: string };
+    if (wallet && activeSubscriptions.has(wallet.address)) {
+      connection.removeOnLogsListener(activeSubscriptions.get(wallet.address)!);
+      activeSubscriptions.delete(wallet.address);
+    }
+    db.prepare("DELETE FROM tracked_wallets WHERE id = ?").run(id);
+    res.json({ success: true });
+  } catch (error) {
+    console.error(">>> Error in DELETE /api/wallets:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+apiRouter.get("/trades", (req, res) => {
+  console.log(">>> Handling GET /api/trades");
+  try {
+    const trades = db.prepare("SELECT * FROM trades ORDER BY created_at DESC LIMIT 50").all();
+    res.json(trades);
+  } catch (error) {
+    console.error(">>> Error in GET /api/trades:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+apiRouter.get("/balance", async (req, res) => {
+  console.log(">>> GET /api/balance");
+  try {
+    const currentConnection = getConnection();
+    const settings = db.prepare("SELECT * FROM settings").all() as { key: string, value: string }[];
+    const settingsMap = settings.reduce((acc: any, curr: any) => {
+      acc[curr.key] = curr.value;
+      return acc;
+    }, {});
+
+    const tradingKey = settingsMap.trading_keypair || process.env.PRIVATE_KEY || process.env.TRADING_KEYPAIR;
+    if (!tradingKey) {
+      console.log(">>> Balance: Trading key not set");
+      return res.json({ balance: 0, address: "Not Set" });
+    }
+
+    const keypair = Keypair.fromSecretKey(bs58.decode(tradingKey));
+    console.log(">>> Fetching balance for:", keypair.publicKey.toBase58());
+    
+    const balance = await withRpcRetry(async () => {
+      return await currentConnection.getBalance(keypair.publicKey);
+    }, 3, 2000);
+
+    console.log(">>> Balance fetched:", balance);
+    res.json({ 
+      balance: balance / LAMPORTS_PER_SOL, 
+      address: keypair.publicKey.toBase58() 
+    });
+  } catch (error) {
+    console.error(">>> Failed to fetch balance:", error);
+    res.status(500).json({ error: "Failed to fetch balance" });
+  }
+});
+
+let cachedSolPrice = 150;
+let lastPriceFetch = 0;
+const PRICE_CACHE_TTL = 30000; // 30 seconds
+
+const getSolPrice = async (): Promise<number> => {
+  const now = Date.now();
+  if (now - lastPriceFetch < PRICE_CACHE_TTL) {
+    return cachedSolPrice;
+  }
+
+  const sources = [
+    {
+      name: "Binance",
+      url: "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT",
+      parser: (data: any) => data?.price
+    },
+    {
+      name: "Jupiter",
+      url: "https://price.jup.ag/v4/price?ids=SOL",
+      parser: (data: any) => data?.data?.SOL?.price
+    },
+    {
+      name: "CoinGecko",
+      url: "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
+      parser: (data: any) => data?.solana?.usd
+    }
+  ];
+
+  for (const source of sources) {
+    try {
+      const price = await withRpcRetry(async () => {
+        const response = await axios.get(source.url, { timeout: 3000 });
+        const p = source.parser(response.data);
+        if (p) return parseFloat(p);
+        throw new Error("Invalid format");
+      }, 0, 0); // No retries per source, just move to next source immediately
+      
+      cachedSolPrice = price;
+      lastPriceFetch = now;
+      return price;
+    } catch (err) {
+      // Silent fail for individual sources to keep logs clean
+    }
+  }
+
+  console.warn("⚠️ All live price sources unreachable, using cached value.");
+  return cachedSolPrice;
+};
+
+apiRouter.get("/stats", async (req, res) => {
+  console.log(">>> Handling GET /api/stats");
+  try {
+    const totalTrades = db.prepare("SELECT COUNT(*) as count FROM trades").get() as { count: number };
+    const activePositions = db.prepare("SELECT COUNT(*) as count FROM positions WHERE is_active = 1").get() as { count: number };
+    
+    const volumeData = db.prepare("SELECT SUM(amount_sol) as volume FROM trades").get() as { volume: number | null };
+    const buyVolume = db.prepare("SELECT SUM(amount_sol) as volume FROM trades WHERE side = 'buy'").get() as { volume: number | null };
+    const sellVolume = db.prepare("SELECT SUM(amount_sol) as volume FROM trades WHERE side = 'sell'").get() as { volume: number | null };
+    
+    const netProfit = (sellVolume.volume || 0) - (buyVolume.volume || 0);
+    const solPrice = await getSolPrice();
+
+    res.json({ 
+      totalTrades: totalTrades.count, 
+      activePositions: activePositions.count,
+      totalVolumeSol: volumeData.volume || 0,
+      netProfitSol: netProfit,
+      solPrice
+    });
+  } catch (error) {
+    console.error(">>> Error in GET /api/stats:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+apiRouter.get("/settings", (req, res) => {
+  console.log(">>> Handling GET /api/settings");
+  try {
+    const settings = db.prepare("SELECT * FROM settings").all();
+    const settingsMap = settings.reduce((acc: any, curr: any) => {
+      acc[curr.key] = curr.value;
+      return acc;
+    }, {});
+    res.json(settingsMap);
+  } catch (error) {
+    console.error(">>> Error in GET /api/settings:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+apiRouter.post("/settings", (req, res) => {
+  console.log(">>> Handling POST /api/settings", req.body);
+  const settings = req.body;
+  try {
+    const upsert = db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)");
+    const transaction = db.transaction((data) => {
+      for (const [key, value] of Object.entries(data)) {
+        upsert.run(key, String(value));
+      }
+    });
+    transaction(settings);
+
+    // If RPC changed, update connection and restart monitoring
+    if (settings.solana_rpc) {
+      console.log("🔄 RPC URL updated, restarting connection...");
+      stopMonitoring();
+      connection = getConnection();
+      startMonitoring();
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error(">>> Error in POST /api/settings:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+// API 404 Handler
+apiRouter.all("*", (req, res) => {
+  console.log(`>>> API 404: ${req.method} ${req.url}`);
+  res.status(404).json({ error: "API Route Not Found" });
+});
+
 // Vite Integration
 async function startServer() {
-  // API Routes
-  app.use(express.json());
-
-  // Request Logger
-  app.use((req, res, next) => {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
-    next();
-  });
-
-  app.get(["/api/wallets", "/api/wallets/"], (req, res) => {
-    console.log(">>> Handling GET /api/wallets");
-    try {
-      const wallets = db.prepare("SELECT * FROM tracked_wallets").all();
-      res.json(wallets);
-    } catch (error) {
-      console.error(">>> Error in GET /api/wallets:", error);
-      res.status(500).json({ error: "Internal Server Error" });
-    }
-  });
-
-  app.post(["/api/wallets", "/api/wallets/"], (req, res) => {
-    console.log(">>> Handling POST /api/wallets", req.body);
-    const { address, label } = req.body;
-    try {
-      db.prepare("INSERT INTO tracked_wallets (address, label) VALUES (?, ?)").run(address, label);
-      startMonitoring();
-      res.json({ success: true });
-    } catch (error) {
-      console.error(">>> Error in POST /api/wallets:", error);
-      res.status(400).json({ error: "Wallet already exists or invalid data" });
-    }
-  });
-
-  app.delete(["/api/wallets/:id", "/api/wallets/:id/"], (req, res) => {
-    console.log(">>> Handling DELETE /api/wallets", req.params.id);
-    const { id } = req.params;
-    try {
-      const wallet = db.prepare("SELECT address FROM tracked_wallets WHERE id = ?").get() as { address: string };
-      if (wallet && activeSubscriptions.has(wallet.address)) {
-        connection.removeOnLogsListener(activeSubscriptions.get(wallet.address)!);
-        activeSubscriptions.delete(wallet.address);
-      }
-      db.prepare("DELETE FROM tracked_wallets WHERE id = ?").run(id);
-      res.json({ success: true });
-    } catch (error) {
-      console.error(">>> Error in DELETE /api/wallets:", error);
-      res.status(500).json({ error: "Internal Server Error" });
-    }
-  });
-
-  app.get(["/api/trades", "/api/trades/"], (req, res) => {
-    console.log(">>> Handling GET /api/trades");
-    try {
-      const trades = db.prepare("SELECT * FROM trades ORDER BY created_at DESC LIMIT 50").all();
-      res.json(trades);
-    } catch (error) {
-      console.error(">>> Error in GET /api/trades:", error);
-      res.status(500).json({ error: "Internal Server Error" });
-    }
-  });
-
-  app.get(["/api/balance", "/api/balance/"], async (req, res) => {
-    console.log(">>> GET /api/balance");
-    try {
-      const currentConnection = getConnection();
-      const settings = db.prepare("SELECT * FROM settings").all() as { key: string, value: string }[];
-      const settingsMap = settings.reduce((acc: any, curr: any) => {
-        acc[curr.key] = curr.value;
-        return acc;
-      }, {});
-
-      const tradingKey = settingsMap.trading_keypair || process.env.PRIVATE_KEY || process.env.TRADING_KEYPAIR;
-      if (!tradingKey) {
-        console.log(">>> Balance: Trading key not set");
-        return res.json({ balance: 0, address: "Not Set" });
-      }
-
-      const keypair = Keypair.fromSecretKey(bs58.decode(tradingKey));
-      console.log(">>> Fetching balance for:", keypair.publicKey.toBase58());
-      const balance = await currentConnection.getBalance(keypair.publicKey);
-      console.log(">>> Balance fetched:", balance);
-      res.json({ 
-        balance: balance / LAMPORTS_PER_SOL, 
-        address: keypair.publicKey.toBase58() 
-      });
-    } catch (error) {
-      console.error(">>> Failed to fetch balance:", error);
-      res.status(500).json({ error: "Failed to fetch balance" });
-    }
-  });
-
-  app.get(["/api/stats", "/api/stats/"], (req, res) => {
-    console.log(">>> Handling GET /api/stats");
-    try {
-      const totalTrades = db.prepare("SELECT COUNT(*) as count FROM trades").get() as { count: number };
-      const activePositions = db.prepare("SELECT COUNT(*) as count FROM positions WHERE is_active = 1").get() as { count: number };
-      res.json({ totalTrades: totalTrades.count, activePositions: activePositions.count });
-    } catch (error) {
-      console.error(">>> Error in GET /api/stats:", error);
-      res.status(500).json({ error: "Internal Server Error" });
-    }
-  });
-
-  app.get(["/api/settings", "/api/settings/"], (req, res) => {
-    console.log(">>> Handling GET /api/settings");
-    try {
-      const settings = db.prepare("SELECT * FROM settings").all();
-      const settingsMap = settings.reduce((acc: any, curr: any) => {
-        acc[curr.key] = curr.value;
-        return acc;
-      }, {});
-      res.json(settingsMap);
-    } catch (error) {
-      console.error(">>> Error in GET /api/settings:", error);
-      res.status(500).json({ error: "Internal Server Error" });
-    }
-  });
-
-  app.post(["/api/settings", "/api/settings/"], (req, res) => {
-    console.log(">>> Handling POST /api/settings", req.body);
-    const settings = req.body;
-    try {
-      const upsert = db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)");
-      const transaction = db.transaction((data) => {
-        for (const [key, value] of Object.entries(data)) {
-          upsert.run(key, String(value));
-        }
-      });
-      transaction(settings);
-
-      // If RPC changed, update connection and restart monitoring
-      if (settings.solana_rpc) {
-        console.log("🔄 RPC URL updated, restarting connection...");
-        stopMonitoring();
-        connection = getConnection();
-        startMonitoring();
-      }
-
-      res.json({ success: true });
-    } catch (error) {
-      console.error(">>> Error in POST /api/settings:", error);
-      res.status(500).json({ error: "Internal Server Error" });
-    }
-  });
-
-  // API 404 Handler
-  app.all("/api/*", (req, res) => {
-    console.log(`>>> API 404: ${req.method} ${req.url}`);
-    res.status(404).json({ error: "API Route Not Found" });
-  });
+  // Mount API Router
+  app.use("/api", apiRouter);
 
   // Vite Integration
   if (process.env.NODE_ENV !== "production") {
