@@ -224,9 +224,9 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     const customJupUrl = settingsMap.jupiter_api_url;
     const endpoints = [
       customJupUrl,
+      "https://public.jupiterapi.com/v6/quote", // Prioritize the public gateway with v6 path
       "https://quote-api.jup.ag/v6/quote",
-      "https://api.jup.ag/v6/quote",
-      "https://public.jupiterapi.com/quote"
+      "https://api.jup.ag/v6/quote"
     ].filter(Boolean) as string[];
 
     console.log(`📡 Fetching quote from Jupiter...`);
