@@ -247,13 +247,14 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     const customJupUrl = settingsMap.jupiter_api_url;
     const endpoints = [
       customJupUrl,
-      "https://public.jupiterapi.com/v6/quote", // Prioritize the public gateway
-      "https://quote-api.jup.ag/v6/quote"
+      "https://quote-api.jup.ag/v6/quote",
+      "https://api.jup.ag/v6/quote"
     ].filter(Boolean) as string[];
 
     console.log(`📡 Fetching quote from Jupiter...`);
     let quoteResponse = null;
     let lastError = "";
+    let successfulBaseUrl = "https://quote-api.jup.ag/v6";
     
     for (const baseUrl of endpoints) {
       let jupRetries = 2;
@@ -262,6 +263,7 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
           const url = `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}inputMint=${isBuy ? "So11111111111111111111111111111111111111112" : tokenMint}&outputMint=${isBuy ? tokenMint : "So11111111111111111111111111111111111111112"}&amount=${amountInLamports}&slippageBps=${slippageBps}`;
           console.log(`🔗 Trying Jupiter endpoint: ${baseUrl}`);
           quoteResponse = await axios.get(url, { timeout: 8000 });
+          successfulBaseUrl = baseUrl.split('?')[0].replace('/quote', '');
           console.log("✅ Quote received successfully!");
         } catch (err: any) {
           jupRetries--;
@@ -277,8 +279,8 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
       throw new Error(`Failed to get a valid quote from any Jupiter endpoint. Last error: ${lastError}`);
     }
     
-    console.log(`📦 Requesting swap transaction from Jupiter...`);
-    const swapResponse = await axios.post("https://quote-api.jup.ag/v6/swap", {
+    console.log(`📦 Requesting swap transaction from Jupiter using ${successfulBaseUrl}/swap...`);
+    const swapResponse = await axios.post(`${successfulBaseUrl}/swap`, {
       quoteResponse: quoteResponse.data,
       userPublicKey: keypair.publicKey.toString(),
       wrapAndUnwrapSol: true,
