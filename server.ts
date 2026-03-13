@@ -20,6 +20,15 @@ const app = express();
 const PORT = 3000;
 const db = new Database("trading.db");
 
+// Global Middleware
+app.use(express.json());
+app.use((req, res, next) => {
+  if (req.url.startsWith('/api')) {
+    console.log(`[${new Date().toISOString()}] GLOBAL API REQUEST: ${req.method} ${req.url}`);
+  }
+  next();
+});
+
 // Initialize Database
 db.exec(`
   CREATE TABLE IF NOT EXISTS tracked_wallets (
@@ -247,14 +256,15 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     const customJupUrl = settingsMap.jupiter_api_url;
     const endpoints = [
       customJupUrl,
+      "https://api.jup.ag/v6/quote",
       "https://quote-api.jup.ag/v6/quote",
-      "https://api.jup.ag/v6/quote"
+      "https://jup.ag/api/v6/quote"
     ].filter(Boolean) as string[];
 
     console.log(`📡 Fetching quote from Jupiter...`);
     let quoteResponse = null;
     let lastError = "";
-    let successfulBaseUrl = "https://quote-api.jup.ag/v6";
+    let successfulBaseUrl = "https://api.jup.ag/v6";
     
     for (const baseUrl of endpoints) {
       let jupRetries = 2;
@@ -262,12 +272,15 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
         try {
           const url = `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}inputMint=${isBuy ? "So11111111111111111111111111111111111111112" : tokenMint}&outputMint=${isBuy ? tokenMint : "So11111111111111111111111111111111111111112"}&amount=${amountInLamports}&slippageBps=${slippageBps}`;
           console.log(`🔗 Trying Jupiter endpoint: ${baseUrl}`);
-          quoteResponse = await axios.get(url, { timeout: 8000 });
+          quoteResponse = await axios.get(url, { 
+            timeout: 8000,
+            headers: { 'Accept': 'application/json' }
+          });
           successfulBaseUrl = baseUrl.split('?')[0].replace('/quote', '');
-          console.log("✅ Quote received successfully!");
+          console.log(`✅ Quote received successfully from ${baseUrl}!`);
         } catch (err: any) {
           jupRetries--;
-          lastError = err.message;
+          lastError = err.response?.data?.error || err.message;
           console.error(`⚠️ Jupiter attempt failed for ${baseUrl} (${jupRetries} retries left):`, lastError);
           if (jupRetries > 0) await new Promise(resolve => setTimeout(resolve, 1500));
         }
@@ -439,11 +452,11 @@ const getTokenPrice = async (mint: string): Promise<number> => {
 
 // API Router
 const apiRouter = express.Router();
-apiRouter.use(express.json());
+// No need for apiRouter.use(express.json()) as it's on the main app now
 
 // Request Logger for API
 apiRouter.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] API ${req.method} ${req.url}`);
+  console.log(`[${new Date().toISOString()}] API ROUTER MATCH: ${req.method} ${req.url}`);
   next();
 });
 
@@ -694,11 +707,11 @@ apiRouter.all("*", (req, res) => {
   res.status(404).json({ error: "API Route Not Found" });
 });
 
+// Mount API Router immediately
+app.use("/api", apiRouter);
+
 // Vite Integration
 async function startServer() {
-  // Mount API Router
-  app.use("/api", apiRouter);
-
   // Vite Integration
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -715,7 +728,11 @@ async function startServer() {
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
-    startMonitoring();
+    try {
+      startMonitoring();
+    } catch (err) {
+      console.error("Failed to start monitoring:", err);
+    }
     setInterval(checkStopLoss, 60000); // Check stop loss every minute
   });
 }
