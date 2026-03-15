@@ -190,6 +190,12 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     const preTokenBalances = originalTx.meta.preTokenBalances || [];
     
     console.log(`🔍 Analyzing token balances for ${walletAddress}...`);
+    const STABLECOINS = [
+      "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
+      "Es9vMFrzaDCSTMdJZYicmcXhqR3RDfCi7Gjvn8iZp47b", // USDT
+      "So11111111111111111111111111111111111111112", // WSOL
+    ];
+
     const tokenChanges = postTokenBalances.filter((post: any) => {
       const pre = preTokenBalances.find((p: any) => p.accountIndex === post.accountIndex);
       return post.owner === walletAddress && (!pre || post.uiTokenAmount.amount !== pre.uiTokenAmount.amount);
@@ -201,8 +207,11 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     }
 
     // Prefer the change that isn't a known stablecoin or common fee token if multiple exist
-    // For now, just take the first significant one
-    const tokenChange = tokenChanges[0];
+    let tokenChange = tokenChanges.find((tc: any) => !STABLECOINS.includes(tc.mint));
+    
+    // Fallback to the first one if all are stablecoins (maybe swapping stablecoins?)
+    if (!tokenChange) tokenChange = tokenChanges[0];
+    
     const tokenMint = tokenChange.mint;
     
     const preAmount = preTokenBalances.find((p: any) => p.accountIndex === tokenChange.accountIndex)?.uiTokenAmount.amount || "0";
@@ -368,10 +377,14 @@ const withRpcRetry = async <T>(fn: () => Promise<T>, retries = 3, delay = 2000):
 const processTransaction = async (signature: string, walletAddress: string) => {
   console.log(`🔍 Processing transaction: ${signature} for wallet: ${walletAddress}`);
   
+  // Initial delay to allow for indexing
+  await new Promise(resolve => setTimeout(resolve, 1000));
+
   let tx = null;
   const currentConnection = getConnection();
 
   try {
+    // Increased retries and delay for indexing
     tx = await withRpcRetry(async () => {
       const result = await currentConnection.getParsedTransaction(signature, {
         maxSupportedTransactionVersion: 0,
@@ -381,14 +394,42 @@ const processTransaction = async (signature: string, walletAddress: string) => {
         throw new Error("Transaction not yet indexed");
       }
       return result;
-    }, 5, 3000);
+    }, 10, 2500); // 10 retries, 2.5s delay = 25s total
   } catch (error) {
     console.error(`❌ Failed to fetch transaction details for ${signature} after retries:`, error);
     return;
   }
 
   const logs = tx.meta.logMessages || [];
-  const isSwap = logs.some(log => {
+  const programIds = tx.transaction.message.accountKeys.map((k: any) => k.pubkey ? k.pubkey.toString() : k.toString());
+  
+  // Known DEX Program IDs
+  const DEX_PROGRAMS = [
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", // Raydium
+    "JUP6LkbZbjS1jKKccR4gc2YEDXAD99D4399e2HBaDbi", // Jupiter V6
+    "JUP4b99eR96sS7XmS9y4f2A9T6v48WqTLv7BBPEu38", // Jupiter V4
+    "6EF8rrecthR5DkZJvE6zW669X9h2u7536t292L37", // Pump.fun
+    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc", // Orca
+    "CAMMCzoZ7NrM3qGgU2dHnwwRTVYmGSC1nvhvNc9vM7h", // Meteora
+    "L33p969p4X3Yp5Gf7f7H7f7H7f7H7f7H7f7H7f7H7f7", // Lifinity
+    "FLUXubRmk97VqcyP95f59K73p7c9p9p9p9p9p9p9p9p", // Fluxbeam
+    "PHOENicpXpXpXpXpXpXpXpXpXpXpXpXpXpXpXpXpXpX", // Phoenix
+    "srmqPvS2o3Y955vLnWxS4D9S1WpGk9p9p9p9p9p9p9p"  // OpenBook
+  ];
+
+  const isDexInteraction = programIds.some(id => DEX_PROGRAMS.includes(id));
+  
+  // Check inner instructions as well
+  const innerInstructions = tx.meta.innerInstructions || [];
+  const hasSwapInnerInstruction = innerInstructions.some((ii: any) => 
+    ii.instructions.some((i: any) => {
+      const pIdx = i.programIdIndex;
+      const pId = tx.transaction.message.accountKeys[pIdx]?.pubkey?.toString() || tx.transaction.message.accountKeys[pIdx]?.toString();
+      return DEX_PROGRAMS.includes(pId);
+    })
+  );
+
+  const isSwap = isDexInteraction || hasSwapInnerInstruction || logs.some(log => {
     const l = log.toLowerCase();
     return l.includes("swap") || 
            l.includes("raydium") || 
@@ -589,31 +630,42 @@ const getSolPrice = async (): Promise<number> => {
     },
     {
       name: "Jupiter",
-      url: "https://price.jup.ag/v4/price?ids=SOL",
+      url: "https://price.jup.ag/v6/price?ids=SOL",
       parser: (data: any) => data?.data?.SOL?.price
     },
     {
       name: "CoinGecko",
       url: "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
       parser: (data: any) => data?.solana?.usd
+    },
+    {
+      name: "Kraken",
+      url: "https://api.kraken.com/0/public/Ticker?pair=SOLUSD",
+      parser: (data: any) => data?.result?.SOLUSD?.c?.[0]
     }
   ];
 
   for (const source of sources) {
     try {
       const price = await withRpcRetry(async () => {
-        const response = await axios.get(source.url, { timeout: 3000 });
+        const response = await axios.get(source.url, { timeout: 4000 });
         const p = source.parser(response.data);
         if (p) return parseFloat(p);
         throw new Error("Invalid format");
-      }, 0, 0); // No retries per source, just move to next source immediately
+      }, 0, 0); 
       
       cachedSolPrice = price;
       lastPriceFetch = now;
+      console.log(`💰 SOL Price updated from ${source.name}: $${price}`);
       return price;
     } catch (err) {
-      // Silent fail for individual sources to keep logs clean
+      // Silent fail for individual sources
     }
+  }
+
+  if (cachedSolPrice === 0) {
+    console.error("❌ ERROR: All price sources failed and no cache available!");
+    return 200; // Hardcoded fallback to prevent division by zero or UI break
   }
 
   console.warn("⚠️ All live price sources unreachable, using cached value.");
