@@ -275,16 +275,18 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     
     // Define base URLs (without /quote or /swap)
     const baseUrls = [
-      customJupUrl?.replace(/\/quote\/?$/, '').replace(/\/swap\/?$/, ''),
-      "https://quote-api.jup.ag/v6",
+      customJupUrl?.replace(/\/+(quote|swap)*\/*$/, ''), // Clean user input
       "https://api.jup.ag/v6",
-      "https://jupiter-frontend.jup.ag/api/v6"
+      "https://api.jup.ag",
+      "https://quote-api.jup.ag/v6",
+      "https://jup.ag/api/v6",
+      "https://public.jupiterapi.com/v6"
     ].filter(Boolean) as string[];
 
     console.log(`📡 Fetching quote from Jupiter...`);
     let quoteResponse = null;
     let lastError = "";
-    let successfulBaseUrl = "https://quote-api.jup.ag/v6";
+    let successfulBaseUrl = "https://api.jup.ag/v6";
     
     for (const baseUrl of baseUrls) {
       let jupRetries = 2;
@@ -294,15 +296,23 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
           const outputMint = isBuy ? tokenMint : "So11111111111111111111111111111111111111112";
           
           // Construct the quote URL correctly
-          const quoteUrl = `${baseUrl}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountInLamports}&slippageBps=${slippageBps}`;
+          // If the URL doesn't have v6 or ultra, we might need to add /v6
+          let finalBase = baseUrl;
+          if (!finalBase.includes('/v6') && !finalBase.includes('/ultra') && !finalBase.includes('/v1') && finalBase.includes('api.jup.ag')) {
+            // If it's just api.jup.ag, try adding /v6 if it's not the ultra endpoint
+            // But we'll try the exact baseUrl first, then maybe fallback
+          }
           
-          console.log(`🔗 Trying Jupiter base: ${baseUrl}`);
+          const quoteUrl = `${finalBase}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountInLamports}&slippageBps=${slippageBps}`;
+          
+          console.log(`🔗 Trying Jupiter base: ${finalBase}`);
           console.log(`📝 Full Quote URL: ${quoteUrl}`);
           
           const headers: any = { 'Accept': 'application/json' };
           if (jupApiKey && jupApiKey.trim() !== "") {
             headers['Authorization'] = `Bearer ${jupApiKey}`;
             headers['x-token'] = jupApiKey;
+            headers['x-api-key'] = jupApiKey; // Standard Jupiter API Key header
           }
 
           const response = await axios.get(quoteUrl, { 
@@ -312,19 +322,30 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
 
           if (response.data && (response.data.outAmount || response.data.data)) {
             quoteResponse = response;
-            successfulBaseUrl = baseUrl;
-            console.log(`✅ Quote received successfully from ${baseUrl}!`);
+            successfulBaseUrl = finalBase;
+            console.log(`✅ Quote received successfully from ${finalBase}!`);
           } else {
             throw new Error("Invalid or empty response from Jupiter");
           }
         } catch (err: any) {
           jupRetries--;
           lastError = err.response?.data?.error || err.response?.data?.message || err.message;
-          console.error(`⚠️ Jupiter attempt failed for ${baseUrl} (${jupRetries} retries left):`, lastError);
           
-          if (String(lastError).includes("401")) {
-            console.error("❌ 401 Unauthorized: Jupiter API key is missing or invalid. Please check your settings.");
-            break; 
+          const errorStr = String(lastError).toLowerCase();
+          if (errorStr.includes("401") || errorStr.includes("unauthorized") || errorStr.includes("forbidden")) {
+            console.error(`❌ Authorization Error for ${baseUrl}: Please verify your Jupiter API Key.`);
+            jupRetries = 0; // Skip to next base URL if key is rejected
+          } else if (errorStr.includes("enotfound")) {
+            console.error(`❌ DNS Error for ${baseUrl}: Hostname not found.`);
+            jupRetries = 0;
+          } else if (errorStr.includes("404")) {
+            console.error(`❌ 404 Not Found for ${baseUrl}: Checking if /v6 is needed...`);
+            // If it's a 404 on api.jup.ag, it might need /v6
+            if (baseUrl === "https://api.jup.ag" && !baseUrl.includes('/v6')) {
+              // We will let the loop continue to the next hardcoded v6 endpoint
+            }
+          } else {
+            console.error(`⚠️ Jupiter attempt failed for ${baseUrl} (${jupRetries} retries left):`, lastError);
           }
           
           if (jupRetries > 0) await new Promise(resolve => setTimeout(resolve, 2000));
@@ -343,6 +364,7 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     if (jupApiKey && jupApiKey.trim() !== "") {
       swapHeaders['Authorization'] = `Bearer ${jupApiKey}`;
       swapHeaders['x-token'] = jupApiKey;
+      swapHeaders['x-api-key'] = jupApiKey;
     }
 
     const swapResponse = await axios.post(`${successfulBaseUrl}/swap`, {
