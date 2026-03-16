@@ -57,9 +57,12 @@ db.exec(`
     amount_token REAL,
     price_sol REAL,
     tx_hash TEXT UNIQUE,
+    original_tx_hash TEXT,
     status TEXT DEFAULT 'pending', -- 'pending', 'completed', 'failed'
     slippage REAL,
     fee REAL,
+    route TEXT,
+    error_message TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 
@@ -73,12 +76,24 @@ db.exec(`
     token_mint TEXT UNIQUE NOT NULL,
     token_symbol TEXT,
     amount REAL DEFAULT 0,
+    amount_raw TEXT DEFAULT '0',
+    decimals INTEGER DEFAULT 0,
     entry_price REAL,
     highest_price REAL,
     stop_loss_percent REAL DEFAULT 10,
     is_active INTEGER DEFAULT 1,
+    last_tx_hash TEXT,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
+
+  CREATE TABLE IF NOT EXISTS processed_signatures (
+    signature TEXT PRIMARY KEY,
+    wallet_address TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_trades_wallet ON trades(wallet_address);
+  CREATE INDEX IF NOT EXISTS idx_trades_token ON trades(token_mint);
 `);
 
 // Solana Connection Helper
@@ -105,14 +120,173 @@ const getTelegramConfig = () => {
 
 const sendTelegramMessage = async (message: string) => {
   const { token, chatId } = getTelegramConfig();
-  if (token && chatId) {
+  if (!token || !chatId) return;
+
+  try {
+    const tempBot = new Telegraf(token);
+    await tempBot.telegram.sendMessage(chatId, message, {
+      parse_mode: "Markdown",
+      link_preview_options: { is_disabled: true },
+    });
+  } catch (error) {
+    console.error("Telegram error:", error);
+  }
+};
+
+// Utils
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const withRpcRetry = async <T>(
+  fn: () => Promise<T>,
+  retries = 3,
+  delay = 2000
+): Promise<T> => {
+  let lastError: any;
+  for (let i = 0; i < retries; i++) {
     try {
-      const tempBot = new Telegraf(token);
-      await tempBot.telegram.sendMessage(chatId, message, { parse_mode: "Markdown" });
+      return await fn();
     } catch (error) {
-      console.error("Telegram error:", error);
+      lastError = error;
+      console.warn(`⚠️ RPC attempt ${i + 1} failed:`, error instanceof Error ? error.message : String(error));
+      if (i < retries - 1) await sleep(delay);
     }
   }
+  throw lastError;
+};
+
+const getSettingsMap = () => {
+  const settings = db.prepare("SELECT * FROM settings").all() as { key: string, value: string }[];
+  return settings.reduce((acc: any, curr: any) => {
+    acc[curr.key] = curr.value;
+    return acc;
+  }, {});
+};
+
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+const STABLECOINS = [
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
+  "Es9vMFrzaDCSTMdJZYicmcXhqR3RDfCi7Gjvn8iZp47b", // USDT
+  SOL_MINT, // WSOL
+];
+
+const getErrorMessage = (error: any) => {
+  return error?.response?.data?.error || error?.response?.data?.message || error?.message || "Unknown error";
+};
+
+// Position Management
+type PositionRow = {
+  id: number;
+  token_mint: string;
+  token_symbol: string | null;
+  amount: number;
+  amount_raw: string;
+  decimals: number;
+  entry_price: number | null;
+  highest_price: number | null;
+  stop_loss_percent: number;
+  is_active: number;
+  last_tx_hash: string | null;
+};
+
+const getPosition = (tokenMint: string): PositionRow | undefined => {
+  return db.prepare("SELECT * FROM positions WHERE token_mint = ?").get(tokenMint) as PositionRow | undefined;
+};
+
+const upsertPositionAfterBuy = (params: {
+  tokenMint: string;
+  tokenSymbol?: string | null;
+  decimals: number;
+  boughtRaw: string;
+  spentSol: number;
+  txid: string;
+}) => {
+  const existing = getPosition(params.tokenMint);
+  const boughtRawBN = new BigNumber(params.boughtRaw);
+  const boughtUi = boughtRawBN.dividedBy(new BigNumber(10).pow(params.decimals));
+  const unitPriceSol = boughtUi.gt(0) ? new BigNumber(params.spentSol).div(boughtUi) : new BigNumber(0);
+
+  if (!existing) {
+    db.prepare(`
+      INSERT INTO positions (
+        token_mint, token_symbol, amount, amount_raw, decimals,
+        entry_price, highest_price, stop_loss_percent, is_active, last_tx_hash, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, CURRENT_TIMESTAMP)
+    `).run(
+      params.tokenMint,
+      params.tokenSymbol || null,
+      boughtUi.toNumber(),
+      boughtRawBN.toFixed(0),
+      params.decimals,
+      unitPriceSol.toNumber(),
+      unitPriceSol.toNumber(),
+      10,
+      params.txid
+    );
+    return;
+  }
+
+  const oldRaw = new BigNumber(existing.amount_raw || "0");
+  const newRaw = oldRaw.plus(boughtRawBN);
+  const oldUi = new BigNumber(existing.amount || 0);
+  const newUi = newRaw.dividedBy(new BigNumber(10).pow(params.decimals));
+
+  let newEntryPrice = unitPriceSol.toNumber();
+  if (existing.entry_price && oldUi.gt(0) && newUi.gt(0)) {
+    const oldCost = oldUi.times(existing.entry_price);
+    const newCost = boughtUi.times(unitPriceSol);
+    newEntryPrice = oldCost.plus(newCost).div(newUi).toNumber();
+  }
+
+  const highestPrice = Math.max(existing.highest_price || 0, newEntryPrice);
+
+  db.prepare(`
+    UPDATE positions
+    SET token_symbol = ?,
+        amount = ?,
+        amount_raw = ?,
+        decimals = ?,
+        entry_price = ?,
+        highest_price = ?,
+        is_active = 1,
+        last_tx_hash = ?,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE token_mint = ?
+  `).run(
+    params.tokenSymbol || existing.token_symbol,
+    newUi.toNumber(),
+    newRaw.toFixed(0),
+    params.decimals,
+    newEntryPrice,
+    highestPrice,
+    params.txid,
+    params.tokenMint
+  );
+};
+
+const updatePositionAfterSell = (params: {
+  tokenMint: string;
+  soldRaw: string;
+  txid: string;
+}) => {
+  const existing = getPosition(params.tokenMint);
+  if (!existing) return;
+
+  const decimals = existing.decimals || 0;
+  const oldRaw = new BigNumber(existing.amount_raw || "0");
+  const soldRaw = new BigNumber(params.soldRaw);
+  const newRaw = BigNumber.maximum(oldRaw.minus(soldRaw), 0);
+  const newUi = newRaw.dividedBy(new BigNumber(10).pow(decimals));
+  const isActive = newRaw.gt(0) ? 1 : 0;
+
+  db.prepare(`
+    UPDATE positions
+    SET amount = ?,
+        amount_raw = ?,
+        is_active = ?,
+        last_tx_hash = ?,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE token_mint = ?
+  `).run(newUi.toNumber(), newRaw.toFixed(0), isActive, params.txid, params.tokenMint);
 };
 
 // Wallet Monitoring Logic
@@ -176,13 +350,8 @@ const startMonitoring = async () => {
 };
 
 // Copy trade logic
-const executeCopyTrade = async (originalTx: any, walletAddress: string, currentConnection: Connection) => {
-  // Get settings from DB
-  const settings = db.prepare("SELECT * FROM settings").all() as { key: string, value: string }[];
-  const settingsMap = settings.reduce((acc: any, curr: any) => {
-    acc[curr.key] = curr.value;
-    return acc;
-  }, {});
+const executeCopyTrade = async (originalTx: any, walletAddress: string, currentConnection: Connection, originalSignature: string) => {
+  const settingsMap = getSettingsMap();
 
   const tradingKey = settingsMap.trading_keypair || process.env.PRIVATE_KEY || process.env.TRADING_KEYPAIR;
   if (!tradingKey) {
@@ -192,17 +361,13 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
 
   try {
     const keypair = Keypair.fromSecretKey(bs58.decode(tradingKey));
+    const traderPubkey = keypair.publicKey;
     
     // 1. Extract Token and Amount from original transaction
     const postTokenBalances = originalTx.meta.postTokenBalances || [];
     const preTokenBalances = originalTx.meta.preTokenBalances || [];
     
     console.log(`🔍 Analyzing token balances for ${walletAddress}...`);
-    const STABLECOINS = [
-      "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
-      "Es9vMFrzaDCSTMdJZYicmcXhqR3RDfCi7Gjvn8iZp47b", // USDT
-      "So11111111111111111111111111111111111111112", // WSOL
-    ];
 
     const tokenChanges = postTokenBalances.filter((post: any) => {
       const pre = preTokenBalances.find((p: any) => p.accountIndex === post.accountIndex);
@@ -214,28 +379,23 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
       return;
     }
 
-    // Prefer the change that isn't a known stablecoin or common fee token if multiple exist
-    let tokenChange = tokenChanges.find((tc: any) => !STABLECOINS.includes(tc.mint));
-    
-    // Fallback to the first one if all are stablecoins (maybe swapping stablecoins?)
-    if (!tokenChange) tokenChange = tokenChanges[0];
-    
+    let tokenChange = tokenChanges.find((tc: any) => !STABLECOINS.includes(tc.mint)) || tokenChanges[0];
     const tokenMint = tokenChange.mint;
     
-    const preAmount = preTokenBalances.find((p: any) => p.accountIndex === tokenChange.accountIndex)?.uiTokenAmount.amount || "0";
-    const postAmount = tokenChange.uiTokenAmount.amount;
+    const preEntry = preTokenBalances.find((p: any) => p.accountIndex === tokenChange.accountIndex);
+    const preAmountRaw = new BigNumber(preEntry?.uiTokenAmount?.amount || "0");
+    const postAmountRaw = new BigNumber(tokenChange.uiTokenAmount.amount);
+    const decimals = tokenChange.uiTokenAmount.decimals;
     
-    const isBuy = new BigNumber(postAmount).gt(preAmount);
+    const isBuy = postAmountRaw.gt(preAmountRaw);
     console.log(`ℹ️ Detected ${isBuy ? "BUY" : "SELL"} for token: ${tokenMint}`);
 
     // Calculate Buy Amount
-    let buyAmountSol = 0.1; // Default fallback
+    let buyAmountSol = 0.1; 
     if (settingsMap.buy_amount && settingsMap.buy_amount.trim() !== "") {
       buyAmountSol = parseFloat(settingsMap.buy_amount);
       console.log(`ℹ️ Using custom buy amount: ${buyAmountSol} SOL`);
     } else {
-      // Copy from original TX
-      // Find SOL change for the wallet
       const accountKeys = originalTx.transaction.message.accountKeys;
       const walletIndex = accountKeys.findIndex((k: any) => {
         const pk = k.pubkey ? k.pubkey.toString() : k.toString();
@@ -246,216 +406,185 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
         const preBal = originalTx.meta.preBalances[walletIndex];
         const postBal = originalTx.meta.postBalances[walletIndex];
         buyAmountSol = Math.abs(preBal - postBal) / LAMPORTS_PER_SOL;
-        // Subtract fee if it's a buy (wallet sends SOL)
         if (isBuy) buyAmountSol -= (originalTx.meta.fee / LAMPORTS_PER_SOL);
       }
       console.log(`ℹ️ Buy amount empty, copying original transaction amount: ${buyAmountSol.toFixed(4)} SOL`);
     }
 
-    // Priority Fee Logic
-    let priorityFee = originalTx.meta.fee; // Default to original TX fee
-    if (settingsMap.priority_fee && settingsMap.priority_fee.trim() !== "") {
-      priorityFee = parseFloat(settingsMap.priority_fee) * LAMPORTS_PER_SOL;
-    }
-    
-    // Slippage Logic
-    let slippageBps = 50; // Default 0.5%
+    let slippageBps = 100; // Default 1%
     if (settingsMap.max_slippage && settingsMap.max_slippage.trim() !== "") {
       slippageBps = Math.floor(parseFloat(settingsMap.max_slippage) * 100);
+    }
+
+    let prioritizationFeeLamports: number | "auto" = "auto";
+    if (settingsMap.priority_fee && settingsMap.priority_fee.trim() !== "") {
+      prioritizationFeeLamports = Math.floor(parseFloat(settingsMap.priority_fee) * LAMPORTS_PER_SOL);
+    }
+
+    const inputMint = isBuy ? SOL_MINT : tokenMint;
+    const outputMint = isBuy ? tokenMint : SOL_MINT;
+
+    let amountRawBN = new BigNumber(0);
+
+    if (isBuy) {
+      amountRawBN = new BigNumber(Math.floor(buyAmountSol * LAMPORTS_PER_SOL).toString());
     } else {
-      slippageBps = 100; // 1% as a 'copy' fallback
-    }
-
-    const amountInLamports = Math.floor(buyAmountSol * LAMPORTS_PER_SOL);
-    console.log(`🎯 Copying ${isBuy ? "BUY" : "SELL"} for ${tokenMint} | Amount: ${buyAmountSol.toFixed(4)} SOL | Fee: ${priorityFee / LAMPORTS_PER_SOL} SOL | Slippage: ${slippageBps/100}%`);
-
-    // 3. Execute Swap via Jupiter API with retries and fallbacks
-    const customJupUrl = settingsMap.jupiter_api_url;
-    const jupApiKey = settingsMap.jupiter_api_key;
-    
-    // Define base URLs (without /quote or /swap)
-    const baseUrls = [
-      customJupUrl?.replace(/\/+(quote|swap|order|execute|v1|v6)*\/*$/, ''), // Clean user input
-      "https://api.jup.ag", // Paid/Basic/Pro endpoint
-      "https://quote-api.jup.ag/v6", // Public V6
-      "https://public.jupiterapi.com/v6" // Backup Public
-    ].filter(Boolean) as string[];
-
-    console.log(`📡 Fetching quote from Jupiter...`);
-    let quoteResponse = null;
-    let lastError = "";
-    let successfulBaseUrl = "";
-    let usedPath = "";
-    
-    for (const baseUrl of baseUrls) {
-      let jupRetries = 2;
-      while (jupRetries > 0 && !quoteResponse) {
-        try {
-          const inputMint = isBuy ? "So11111111111111111111111111111111111111112" : tokenMint;
-          const outputMint = isBuy ? tokenMint : "So11111111111111111111111111111111111111112";
-          
-          let quotePath = "/quote";
-          // Logic based on the shared documentation:
-          if (baseUrl.includes("api.jup.ag") && !baseUrl.includes("ultra")) {
-            quotePath = "/swap/v1/quote"; // Metis/Klasik flow
-          } else if (baseUrl.includes("ultra")) {
-            quotePath = "/ultra/v1/order"; // Ultra flow
-          } else if (baseUrl.includes("quote-api")) {
-            quotePath = "/v6/quote";
-          }
-          
-          const quoteUrl = `${baseUrl}${quotePath}?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountInLamports}&slippageBps=${slippageBps}`;
-          
-          console.log(`🔗 Trying Jupiter base: ${baseUrl} | Path: ${quotePath}`);
-          console.log(`📝 Full URL: ${quoteUrl}`);
-          
-          const headers: any = { 'Accept': 'application/json' };
-          if (jupApiKey && jupApiKey.trim() !== "") {
-            headers['x-api-key'] = jupApiKey; // Primary header as per docs
-            headers['Authorization'] = `Bearer ${jupApiKey}`;
-            headers['x-token'] = jupApiKey;
-          }
-
-          const response = await axios.get(quoteUrl, { 
-            timeout: 10000,
-            headers
-          });
-
-          // Check for valid response (Ultra uses 'data', Metis/V6 uses 'outAmount')
-          if (response.data && (response.data.outAmount || response.data.data || response.data.swapTransaction)) {
-            quoteResponse = response;
-            successfulBaseUrl = baseUrl;
-            usedPath = quotePath;
-            console.log(`✅ Quote received successfully from ${baseUrl}!`);
-          } else {
-            throw new Error("Invalid or empty response from Jupiter");
-          }
-        } catch (err: any) {
-          jupRetries--;
-          lastError = err.response?.data?.error || err.response?.data?.message || err.message;
-          
-          const errorStr = String(lastError).toLowerCase();
-          if (errorStr.includes("401") || errorStr.includes("unauthorized") || errorStr.includes("forbidden")) {
-            console.error(`❌ Authorization Error for ${baseUrl}: Please verify your Jupiter API Key.`);
-            jupRetries = 0; // Skip to next base URL if key is rejected
-          } else if (errorStr.includes("enotfound")) {
-            console.error(`❌ DNS Error for ${baseUrl}: Hostname not found.`);
-            jupRetries = 0;
-          } else if (errorStr.includes("404")) {
-            console.error(`❌ 404 Not Found for ${baseUrl}: Path might be incorrect.`);
-          } else {
-            console.error(`⚠️ Jupiter attempt failed for ${baseUrl} (${jupRetries} retries left):`, lastError);
-          }
-          
-          if (jupRetries > 0) await new Promise(resolve => setTimeout(resolve, 2000));
-        }
+      // SELL logic: Check our own position
+      const position = getPosition(tokenMint);
+      if (!position || !position.is_active) {
+        console.log(`⚠️ No active position for ${tokenMint}, skipping sell.`);
+        return;
       }
-      if (quoteResponse) break;
+
+      const positionRaw = new BigNumber(position.amount_raw || "0");
+      const sellPercent = parseFloat(settingsMap.sell_percent || "100");
+      amountRawBN = positionRaw.times(sellPercent).div(100).integerValue(BigNumber.ROUND_FLOOR);
+
+      if (amountRawBN.lte(0)) {
+        console.log("⚠️ Calculated sell amount is zero. Skipping.");
+        return;
+      }
+
+      // Double check actual wallet balance
+      const traderTokenAccounts = await currentConnection.getParsedTokenAccountsByOwner(
+        traderPubkey,
+        { mint: new PublicKey(tokenMint) },
+        "confirmed"
+      );
+
+      const actualWalletRaw = traderTokenAccounts.value.reduce((sum, acc) => {
+        const raw = new BigNumber(acc.account.data.parsed.info.tokenAmount.amount || "0");
+        return sum.plus(raw);
+      }, new BigNumber(0));
+
+      if (actualWalletRaw.lt(amountRawBN)) {
+        console.log(`⚠️ Actual balance (${actualWalletRaw.toFixed()}) is less than intended sell (${amountRawBN.toFixed()}). Adjusting.`);
+        amountRawBN = actualWalletRaw;
+      }
     }
 
-    if (!quoteResponse || !quoteResponse.data) {
-      throw new Error(`Failed to get a valid quote from any Jupiter endpoint. Last error: ${lastError}`);
-    }
-    
-    // 4. Get Swap Transaction
-    let swapPath = "/swap";
-    if (usedPath.includes("/swap/v1/quote")) {
-      swapPath = "/swap/v1/swap";
-    } else if (usedPath.includes("/ultra/v1/order")) {
-      swapPath = "/ultra/v1/execute";
-    } else if (usedPath.includes("/v6/quote")) {
-      swapPath = "/v6/swap";
+    if (amountRawBN.lte(0)) {
+      throw new Error("Calculated swap amount is zero");
     }
 
-    console.log(`📦 Requesting swap transaction using ${successfulBaseUrl}${swapPath}...`);
-    
-    const swapHeaders: any = { 'Content-Type': 'application/json' };
-    if (jupApiKey && jupApiKey.trim() !== "") {
-      swapHeaders['x-api-key'] = jupApiKey;
-      swapHeaders['Authorization'] = `Bearer ${jupApiKey}`;
-      swapHeaders['x-token'] = jupApiKey;
+    console.log(`🎯 Executing ${isBuy ? "BUY" : "SELL"} | Token: ${tokenMint} | Amount: ${amountRawBN.toFixed(0)} raw units`);
+
+    const jupApiKey = settingsMap.jupiter_api_key || process.env.JUPITER_API_KEY;
+    const jupBaseUrl = "https://api.jup.ag";
+
+    const headers: any = { 'Accept': 'application/json' };
+    if (jupApiKey) headers['x-api-key'] = jupApiKey;
+
+    const quoteUrl = `${jupBaseUrl}/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountRawBN.toFixed(0)}&slippageBps=${slippageBps}`;
+    console.log(`📡 Fetching quote: ${quoteUrl}`);
+
+    const quoteResponse = await axios.get(quoteUrl, { timeout: 10000, headers });
+
+    if (!quoteResponse.data || !quoteResponse.data.outAmount) {
+      throw new Error("Invalid quote response from Jupiter");
     }
 
-    const swapResponse = await axios.post(`${successfulBaseUrl}${swapPath}`, {
+    const swapResponse = await axios.post(`${jupBaseUrl}/swap/v1/swap`, {
       quoteResponse: quoteResponse.data,
-      userPublicKey: keypair.publicKey.toString(),
+      userPublicKey: traderPubkey.toBase58(),
       wrapAndUnwrapSol: true,
-      prioritizationFeeLamports: Math.floor(priorityFee)
-    }, { 
-      timeout: 10000,
-      headers: swapHeaders
-    });
+      dynamicComputeUnitLimit: true,
+      prioritizationFeeLamports
+    }, { timeout: 15000, headers });
 
-    if (!swapResponse.data || !swapResponse.data.swapTransaction) {
+    if (!swapResponse.data?.swapTransaction) {
       throw new Error("Failed to get swap transaction from Jupiter");
     }
 
-    const { swapTransaction } = swapResponse.data;
-    
-    // Deserialize and sign
-    const swapTransactionBuf = Buffer.from(swapTransaction, 'base64');
-    const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
-    
-    // Get latest blockhash for the transaction
-    const { blockhash } = await currentConnection.getLatestBlockhash();
-    transaction.message.recentBlockhash = blockhash;
-    
+    const transaction = VersionedTransaction.deserialize(Buffer.from(swapResponse.data.swapTransaction, 'base64'));
+    const latestBlockhash = await currentConnection.getLatestBlockhash("confirmed");
+    transaction.message.recentBlockhash = latestBlockhash.blockhash;
     transaction.sign([keypair]);
     
-    console.log(`🚀 Sending transaction to blockchain...`);
+    console.log(`🚀 Sending transaction...`);
     const txid = await currentConnection.sendRawTransaction(transaction.serialize(), {
-      skipPreflight: true,
+      skipPreflight: false,
       maxRetries: 3
     });
     
-    console.log(`⏳ Waiting for confirmation: ${txid}`);
-    const latestBlockHash = await currentConnection.getLatestBlockhash();
-    await currentConnection.confirmTransaction({
-      blockhash: latestBlockHash.blockhash,
-      lastValidBlockHeight: latestBlockHash.lastValidBlockHeight,
-      signature: txid
+    console.log(`⏳ Confirming: ${txid}`);
+    const confirmation = await currentConnection.confirmTransaction({
+      signature: txid,
+      blockhash: latestBlockhash.blockhash,
+      lastValidBlockHeight: latestBlockhash.lastValidBlockHeight
     }, 'confirmed');
 
-    console.log(`✅ Transaction confirmed: ${txid}`);
+    if (confirmation.value.err) {
+      throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
+    }
 
-    // Record the trade in DB
-    db.prepare("INSERT INTO trades (wallet_address, token_mint, side, amount_sol, status, tx_hash, fee) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+    console.log(`✅ Confirmed: ${txid}`);
+
+    // Fetch final tx to get actual delta
+    const finalTx = await currentConnection.getTransaction(txid, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0
+    });
+
+    const traderPostBal = finalTx?.meta?.postTokenBalances?.find(b => b.owner === traderPubkey.toBase58() && b.mint === tokenMint);
+    const traderPreBal = finalTx?.meta?.preTokenBalances?.find(b => b.owner === traderPubkey.toBase58() && b.mint === tokenMint);
+    const traderDeltaRaw = new BigNumber(traderPostBal?.uiTokenAmount?.amount || "0").minus(new BigNumber(traderPreBal?.uiTokenAmount?.amount || "0")).abs();
+
+    // Record trade
+    db.prepare(`
+      INSERT INTO trades (
+        wallet_address, token_mint, side, amount_sol, amount_token, status, tx_hash, original_tx_hash, fee, slippage
+      ) VALUES (?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?)
+    `).run(
       walletAddress,
       tokenMint,
       isBuy ? "buy" : "sell",
-      buyAmountSol,
-      "completed",
+      isBuy ? amountRawBN.toNumber() / LAMPORTS_PER_SOL : null,
+      traderDeltaRaw.dividedBy(new BigNumber(10).pow(decimals)).toNumber(),
       txid,
-      priorityFee / LAMPORTS_PER_SOL
+      originalSignature,
+      (finalTx?.meta?.fee || 0) / LAMPORTS_PER_SOL,
+      slippageBps / 100
     );
 
-    await sendTelegramMessage(`✅ *Trade Executed!*\nToken: \`${tokenMint}\`\nSide: ${isBuy ? "BUY" : "SELL"}\nAmount: ${buyAmountSol.toFixed(4)} SOL\nTX: [View on Solscan](https://solscan.io/tx/${txid})`);
+    // Update position
+    if (isBuy) {
+      upsertPositionAfterBuy({
+        tokenMint,
+        decimals,
+        boughtRaw: traderDeltaRaw.toFixed(0),
+        spentSol: amountRawBN.toNumber() / LAMPORTS_PER_SOL,
+        txid
+      });
+    } else {
+      updatePositionAfterSell({
+        tokenMint,
+        soldRaw: amountRawBN.toFixed(0),
+        txid
+      });
+    }
+
+    await sendTelegramMessage(`✅ *Trade Executed!*\nSide: ${isBuy ? "BUY" : "SELL"}\nToken: \`${tokenMint}\`\nTX: [Solscan](https://solscan.io/tx/${txid})`);
 
   } catch (error) {
-    console.error("Copy trade execution failed:", error);
-    await sendTelegramMessage(`❌ *Copy Trade Failed*\nError: ${error instanceof Error ? error.message : "Unknown error"}`);
+    console.error("Copy trade failed:", error);
+    const errMsg = getErrorMessage(error);
+    await sendTelegramMessage(`❌ *Copy Trade Failed*\nError: ${errMsg}`);
   }
-};
-
-const withRpcRetry = async <T>(fn: () => Promise<T>, retries = 3, delay = 2000): Promise<T> => {
-  let lastError: any;
-  for (let i = 0; i < retries; i++) {
-    try {
-      return await fn();
-    } catch (error) {
-      lastError = error;
-      console.warn(`⚠️ RPC attempt ${i + 1} failed:`, error instanceof Error ? error.message : String(error));
-      if (i < retries - 1) await new Promise(resolve => setTimeout(resolve, delay));
-    }
-  }
-  throw lastError;
 };
 
 const processTransaction = async (signature: string, walletAddress: string) => {
   console.log(`🔍 Processing transaction: ${signature} for wallet: ${walletAddress}`);
   
+  // Check if already processed
+  const alreadyProcessed = db.prepare("SELECT signature FROM processed_signatures WHERE signature = ?").get(signature);
+  if (alreadyProcessed) {
+    console.log(`ℹ️ Signature ${signature} already processed. Skipping.`);
+    return;
+  }
+
   // Initial delay to allow for indexing
-  await new Promise(resolve => setTimeout(resolve, 1000));
+  await sleep(1200);
 
   let tx = null;
   const currentConnection = getConnection();
@@ -472,6 +601,14 @@ const processTransaction = async (signature: string, walletAddress: string) => {
       }
       return result;
     }, 10, 2500); // 10 retries, 2.5s delay = 25s total
+
+    // Mark as processed
+    db.prepare("INSERT OR IGNORE INTO processed_signatures (signature, wallet_address) VALUES (?, ?)").run(signature, walletAddress);
+
+    if (tx.meta?.err) {
+      console.log(`⚠️ Original transaction ${signature} failed on-chain. Skipping copy.`);
+      return;
+    }
   } catch (error) {
     console.error(`❌ Failed to fetch transaction details for ${signature} after retries:`, error);
     return;
@@ -489,7 +626,7 @@ const processTransaction = async (signature: string, walletAddress: string) => {
     "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc", // Orca
     "CAMMCzoZ7NrM3qGgU2dHnwwRTVYmGSC1nvhvNc9vM7h", // Meteora
     "L33p969p4X3Yp5Gf7f7H7f7H7f7H7f7H7f7H7f7H7f7", // Lifinity
-    "FLUXubRmk97VqcyP95f59K73p7c9p9p9p9p9p9p9p9p", // Fluxbeam
+    "FLUXubRmk97VqcyP95f59K73p7c9p9p9p9p9p9p9p", // Fluxbeam
     "PHOENicpXpXpXpXpXpXpXpXpXpXpXpXpXpXpXpXpXpX", // Phoenix
     "srmqPvS2o3Y955vLnWxS4D9S1WpGk9p9p9p9p9p9p9p"  // OpenBook
   ];
@@ -530,7 +667,7 @@ const processTransaction = async (signature: string, walletAddress: string) => {
     await sendTelegramMessage(`🚀 *New Swap Detected!*\nWallet: \`${walletAddress}\`\nTX: [View on Solscan](https://solscan.io/tx/${signature})\nFee: ${fee} SOL`);
     
     // Execute the copy trade
-    await executeCopyTrade(tx, walletAddress, currentConnection);
+    await executeCopyTrade(tx, walletAddress, currentConnection, signature);
   } else {
     console.log(`ℹ️ Transaction ${signature} is not a recognized swap.`);
   }
@@ -564,13 +701,60 @@ const checkStopLoss = async () => {
 };
 
 const getTokenPrice = async (mint: string): Promise<number> => {
-  // Mock price fetch. In reality, use Jupiter or Birdeye API.
-  return Math.random() * 10; 
+  if (STABLECOINS.includes(mint)) return 1.0;
+  
+  try {
+    // Try Jupiter Price API
+    const response = await axios.get(`https://api.jup.ag/price/v2?ids=${mint}`, { timeout: 5000 });
+    const price = response.data?.data?.[mint]?.price;
+    if (price) return parseFloat(price);
+  } catch (err) {
+    // Fallback to cached SOL price if mint is SOL
+    if (mint === SOL_MINT) return cachedSolPrice;
+  }
+  
+  return 0; 
 };
 
 // API Router
-// apiRouter already defined above
-// No need for apiRouter.use(express.json()) as it's on the main app now
+apiRouter.get("/pnl", async (req, res) => {
+  try {
+    const positions = db.prepare("SELECT * FROM positions WHERE is_active = 1").all() as PositionRow[];
+    const solPrice = await getSolPrice();
+    
+    const pnlData = await Promise.all(positions.map(async (pos) => {
+      const currentPrice = await getTokenPrice(pos.token_mint);
+      const entryPrice = pos.entry_price || 0;
+      const amount = pos.amount || 0;
+      
+      const profitSol = amount * (currentPrice - entryPrice);
+      const profitUsd = profitSol * solPrice;
+      const profitPercent = entryPrice > 0 ? ((currentPrice - entryPrice) / entryPrice) * 100 : 0;
+      
+      return {
+        ...pos,
+        current_price: currentPrice,
+        profit_sol: profitSol,
+        profit_usd: profitUsd,
+        profit_percent: profitPercent
+      };
+    }));
+    
+    res.json(pnlData);
+  } catch (error) {
+    console.error(">>> Error in GET /api/pnl:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+apiRouter.get("/positions", (req, res) => {
+  try {
+    const positions = db.prepare("SELECT * FROM positions ORDER BY updated_at DESC").all();
+    res.json(positions);
+  } catch (error) {
+    console.error(">>> Error in GET /api/positions:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
 
 // Request Logger for API
 apiRouter.use((req, res, next) => {
@@ -856,6 +1040,23 @@ async function startServer() {
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
+    
+    // Initialize default settings if they don't exist
+    const defaultSettings = {
+      buy_amount: "0.1",
+      sell_percent: "100",
+      max_slippage: "1",
+      priority_fee: "0.0005",
+      min_sol_reserve: "0.02",
+      min_trade_sol: "0.01",
+      bot_enabled: "true"
+    };
+    
+    const upsert = db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)");
+    for (const [key, value] of Object.entries(defaultSettings)) {
+      upsert.run(key, value);
+    }
+
     try {
       startMonitoring();
     } catch (err) {
