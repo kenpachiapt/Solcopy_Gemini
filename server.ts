@@ -275,18 +275,17 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     
     // Define base URLs (without /quote or /swap)
     const baseUrls = [
-      customJupUrl?.replace(/\/+(quote|swap)*\/*$/, ''), // Clean user input
-      "https://api.jup.ag/v6",
-      "https://api.jup.ag",
-      "https://quote-api.jup.ag/v6",
-      "https://jup.ag/api/v6",
-      "https://public.jupiterapi.com/v6"
+      customJupUrl?.replace(/\/+(quote|swap|order|execute|v1|v6)*\/*$/, ''), // Clean user input
+      "https://api.jup.ag", // Paid/Basic/Pro endpoint
+      "https://quote-api.jup.ag/v6", // Public V6
+      "https://public.jupiterapi.com/v6" // Backup Public
     ].filter(Boolean) as string[];
 
     console.log(`📡 Fetching quote from Jupiter...`);
     let quoteResponse = null;
     let lastError = "";
-    let successfulBaseUrl = "https://api.jup.ag/v6";
+    let successfulBaseUrl = "";
+    let usedPath = "";
     
     for (const baseUrl of baseUrls) {
       let jupRetries = 2;
@@ -295,24 +294,26 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
           const inputMint = isBuy ? "So11111111111111111111111111111111111111112" : tokenMint;
           const outputMint = isBuy ? tokenMint : "So11111111111111111111111111111111111111112";
           
-          // Construct the quote URL correctly
-          // If the URL doesn't have v6 or ultra, we might need to add /v6
-          let finalBase = baseUrl;
-          if (!finalBase.includes('/v6') && !finalBase.includes('/ultra') && !finalBase.includes('/v1') && finalBase.includes('api.jup.ag')) {
-            // If it's just api.jup.ag, try adding /v6 if it's not the ultra endpoint
-            // But we'll try the exact baseUrl first, then maybe fallback
+          let quotePath = "/quote";
+          // Logic based on the shared documentation:
+          if (baseUrl.includes("api.jup.ag") && !baseUrl.includes("ultra")) {
+            quotePath = "/swap/v1/quote"; // Metis/Klasik flow
+          } else if (baseUrl.includes("ultra")) {
+            quotePath = "/ultra/v1/order"; // Ultra flow
+          } else if (baseUrl.includes("quote-api")) {
+            quotePath = "/v6/quote";
           }
           
-          const quoteUrl = `${finalBase}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountInLamports}&slippageBps=${slippageBps}`;
+          const quoteUrl = `${baseUrl}${quotePath}?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountInLamports}&slippageBps=${slippageBps}`;
           
-          console.log(`🔗 Trying Jupiter base: ${finalBase}`);
-          console.log(`📝 Full Quote URL: ${quoteUrl}`);
+          console.log(`🔗 Trying Jupiter base: ${baseUrl} | Path: ${quotePath}`);
+          console.log(`📝 Full URL: ${quoteUrl}`);
           
           const headers: any = { 'Accept': 'application/json' };
           if (jupApiKey && jupApiKey.trim() !== "") {
+            headers['x-api-key'] = jupApiKey; // Primary header as per docs
             headers['Authorization'] = `Bearer ${jupApiKey}`;
             headers['x-token'] = jupApiKey;
-            headers['x-api-key'] = jupApiKey; // Standard Jupiter API Key header
           }
 
           const response = await axios.get(quoteUrl, { 
@@ -320,10 +321,12 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
             headers
           });
 
-          if (response.data && (response.data.outAmount || response.data.data)) {
+          // Check for valid response (Ultra uses 'data', Metis/V6 uses 'outAmount')
+          if (response.data && (response.data.outAmount || response.data.data || response.data.swapTransaction)) {
             quoteResponse = response;
-            successfulBaseUrl = finalBase;
-            console.log(`✅ Quote received successfully from ${finalBase}!`);
+            successfulBaseUrl = baseUrl;
+            usedPath = quotePath;
+            console.log(`✅ Quote received successfully from ${baseUrl}!`);
           } else {
             throw new Error("Invalid or empty response from Jupiter");
           }
@@ -339,11 +342,7 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
             console.error(`❌ DNS Error for ${baseUrl}: Hostname not found.`);
             jupRetries = 0;
           } else if (errorStr.includes("404")) {
-            console.error(`❌ 404 Not Found for ${baseUrl}: Checking if /v6 is needed...`);
-            // If it's a 404 on api.jup.ag, it might need /v6
-            if (baseUrl === "https://api.jup.ag" && !baseUrl.includes('/v6')) {
-              // We will let the loop continue to the next hardcoded v6 endpoint
-            }
+            console.error(`❌ 404 Not Found for ${baseUrl}: Path might be incorrect.`);
           } else {
             console.error(`⚠️ Jupiter attempt failed for ${baseUrl} (${jupRetries} retries left):`, lastError);
           }
@@ -358,16 +357,26 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
       throw new Error(`Failed to get a valid quote from any Jupiter endpoint. Last error: ${lastError}`);
     }
     
-    console.log(`📦 Requesting swap transaction from Jupiter using ${successfulBaseUrl}/swap...`);
+    // 4. Get Swap Transaction
+    let swapPath = "/swap";
+    if (usedPath.includes("/swap/v1/quote")) {
+      swapPath = "/swap/v1/swap";
+    } else if (usedPath.includes("/ultra/v1/order")) {
+      swapPath = "/ultra/v1/execute";
+    } else if (usedPath.includes("/v6/quote")) {
+      swapPath = "/v6/swap";
+    }
+
+    console.log(`📦 Requesting swap transaction using ${successfulBaseUrl}${swapPath}...`);
     
     const swapHeaders: any = { 'Content-Type': 'application/json' };
     if (jupApiKey && jupApiKey.trim() !== "") {
+      swapHeaders['x-api-key'] = jupApiKey;
       swapHeaders['Authorization'] = `Bearer ${jupApiKey}`;
       swapHeaders['x-token'] = jupApiKey;
-      swapHeaders['x-api-key'] = jupApiKey;
     }
 
-    const swapResponse = await axios.post(`${successfulBaseUrl}/swap`, {
+    const swapResponse = await axios.post(`${successfulBaseUrl}${swapPath}`, {
       quoteResponse: quoteResponse.data,
       userPublicKey: keypair.publicKey.toString(),
       wrapAndUnwrapSol: true,
