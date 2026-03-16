@@ -92,7 +92,9 @@ export default function App() {
     trading_keypair: "",
     telegram_token: "",
     telegram_chat_id: "",
-    solana_rpc: ""
+    solana_rpc: "",
+    jupiter_api_url: "https://quote-api.jup.ag/v6/quote",
+    jupiter_api_key: ""
   });
 
   const fetchData = async () => {
@@ -897,6 +899,26 @@ export default function App() {
                           placeholder="https://api.mainnet-beta.solana.com"
                           value={settings.solana_rpc} 
                           onChange={(e) => setSettings({...settings, solana_rpc: e.target.value})}
+                          className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#14F195]/50" 
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <label className="text-[10px] text-gray-500 uppercase font-bold">Jupiter API URL'si</label>
+                        <input 
+                          type="text" 
+                          placeholder="https://quote-api.jup.ag/v6/quote"
+                          value={settings.jupiter_api_url} 
+                          onChange={(e) => setSettings({...settings, jupiter_api_url: e.target.value})}
+                          className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#14F195]/50" 
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <label className="text-[10px] text-gray-500 uppercase font-bold">Jupiter API Anahtarı (Opsiyonel)</label>
+                        <input 
+                          type="password" 
+                          placeholder="API Anahtarınız (401 hatası alıyorsanız gereklidir)"
+                          value={settings.jupiter_api_key} 
+                          onChange={(e) => setSettings({...settings, jupiter_api_key: e.target.value})}
                           className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#14F195]/50" 
                         />
                       </div>

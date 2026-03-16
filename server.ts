@@ -20,14 +20,22 @@ const app = express();
 const PORT = 3000;
 const db = new Database("trading.db");
 
+// API Router Definition (Early)
+const apiRouter = express.Router();
+
 // Global Middleware
 app.use(express.json());
 app.use((req, res, next) => {
   if (req.url.startsWith('/api')) {
     console.log(`[${new Date().toISOString()}] GLOBAL API REQUEST: ${req.method} ${req.url}`);
+    // Force JSON content type for all /api requests
+    res.setHeader('Content-Type', 'application/json');
   }
   next();
 });
+
+// Mount API Router early to ensure it takes precedence
+app.use("/api", apiRouter);
 
 // Initialize Database
 db.exec(`
@@ -263,35 +271,63 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
 
     // 3. Execute Swap via Jupiter API with retries and fallbacks
     const customJupUrl = settingsMap.jupiter_api_url;
-    const endpoints = [
-      customJupUrl,
-      "https://api.jup.ag/v6/quote",
-      "https://quote-api.jup.ag/v6/quote",
-      "https://jup.ag/api/v6/quote"
+    const jupApiKey = settingsMap.jupiter_api_key;
+    
+    // Define base URLs (without /quote or /swap)
+    const baseUrls = [
+      customJupUrl?.replace(/\/quote\/?$/, '').replace(/\/swap\/?$/, ''),
+      "https://quote-api.jup.ag/v6",
+      "https://api.jup.ag/v6",
+      "https://jupiter-frontend.jup.ag/api/v6"
     ].filter(Boolean) as string[];
 
     console.log(`📡 Fetching quote from Jupiter...`);
     let quoteResponse = null;
     let lastError = "";
-    let successfulBaseUrl = "https://api.jup.ag/v6";
+    let successfulBaseUrl = "https://quote-api.jup.ag/v6";
     
-    for (const baseUrl of endpoints) {
+    for (const baseUrl of baseUrls) {
       let jupRetries = 2;
       while (jupRetries > 0 && !quoteResponse) {
         try {
-          const url = `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}inputMint=${isBuy ? "So11111111111111111111111111111111111111112" : tokenMint}&outputMint=${isBuy ? tokenMint : "So11111111111111111111111111111111111111112"}&amount=${amountInLamports}&slippageBps=${slippageBps}`;
-          console.log(`🔗 Trying Jupiter endpoint: ${baseUrl}`);
-          quoteResponse = await axios.get(url, { 
-            timeout: 8000,
-            headers: { 'Accept': 'application/json' }
+          const inputMint = isBuy ? "So11111111111111111111111111111111111111112" : tokenMint;
+          const outputMint = isBuy ? tokenMint : "So11111111111111111111111111111111111111112";
+          
+          // Construct the quote URL correctly
+          const quoteUrl = `${baseUrl}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountInLamports}&slippageBps=${slippageBps}`;
+          
+          console.log(`🔗 Trying Jupiter base: ${baseUrl}`);
+          console.log(`📝 Full Quote URL: ${quoteUrl}`);
+          
+          const headers: any = { 'Accept': 'application/json' };
+          if (jupApiKey && jupApiKey.trim() !== "") {
+            headers['Authorization'] = `Bearer ${jupApiKey}`;
+            headers['x-token'] = jupApiKey;
+          }
+
+          const response = await axios.get(quoteUrl, { 
+            timeout: 10000,
+            headers
           });
-          successfulBaseUrl = baseUrl.split('?')[0].replace('/quote', '');
-          console.log(`✅ Quote received successfully from ${baseUrl}!`);
+
+          if (response.data && (response.data.outAmount || response.data.data)) {
+            quoteResponse = response;
+            successfulBaseUrl = baseUrl;
+            console.log(`✅ Quote received successfully from ${baseUrl}!`);
+          } else {
+            throw new Error("Invalid or empty response from Jupiter");
+          }
         } catch (err: any) {
           jupRetries--;
-          lastError = err.response?.data?.error || err.message;
+          lastError = err.response?.data?.error || err.response?.data?.message || err.message;
           console.error(`⚠️ Jupiter attempt failed for ${baseUrl} (${jupRetries} retries left):`, lastError);
-          if (jupRetries > 0) await new Promise(resolve => setTimeout(resolve, 1500));
+          
+          if (String(lastError).includes("401")) {
+            console.error("❌ 401 Unauthorized: Jupiter API key is missing or invalid. Please check your settings.");
+            break; 
+          }
+          
+          if (jupRetries > 0) await new Promise(resolve => setTimeout(resolve, 2000));
         }
       }
       if (quoteResponse) break;
@@ -302,12 +338,22 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     }
     
     console.log(`📦 Requesting swap transaction from Jupiter using ${successfulBaseUrl}/swap...`);
+    
+    const swapHeaders: any = { 'Content-Type': 'application/json' };
+    if (jupApiKey && jupApiKey.trim() !== "") {
+      swapHeaders['Authorization'] = `Bearer ${jupApiKey}`;
+      swapHeaders['x-token'] = jupApiKey;
+    }
+
     const swapResponse = await axios.post(`${successfulBaseUrl}/swap`, {
       quoteResponse: quoteResponse.data,
       userPublicKey: keypair.publicKey.toString(),
       wrapAndUnwrapSol: true,
       prioritizationFeeLamports: Math.floor(priorityFee)
-    }, { timeout: 10000 });
+    }, { 
+      timeout: 10000,
+      headers: swapHeaders
+    });
 
     if (!swapResponse.data || !swapResponse.data.swapTransaction) {
       throw new Error("Failed to get swap transaction from Jupiter");
@@ -492,7 +538,7 @@ const getTokenPrice = async (mint: string): Promise<number> => {
 };
 
 // API Router
-const apiRouter = express.Router();
+// apiRouter already defined above
 // No need for apiRouter.use(express.json()) as it's on the main app now
 
 // Request Logger for API
@@ -630,7 +676,7 @@ const getSolPrice = async (): Promise<number> => {
     },
     {
       name: "Jupiter",
-      url: "https://price.jup.ag/v6/price?ids=SOL",
+      url: "https://price.jup.ag/v4/price?ids=SOL",
       parser: (data: any) => data?.data?.SOL?.price
     },
     {
@@ -759,8 +805,7 @@ apiRouter.all("*", (req, res) => {
   res.status(404).json({ error: "API Route Not Found" });
 });
 
-// Mount API Router immediately
-app.use("/api", apiRouter);
+// Mount API Router immediately - ALREADY MOUNTED AT TOP
 
 // Vite Integration
 async function startServer() {
