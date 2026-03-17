@@ -1,6 +1,6 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
-import { Connection, PublicKey, Keypair, Transaction, SystemProgram, LAMPORTS_PER_SOL, VersionedTransaction } from "@solana/web3.js";
+import { Connection, PublicKey, Keypair, Transaction, SystemProgram, LAMPORTS_PER_SOL, VersionedTransaction, SendTransactionError } from "@solana/web3.js";
 import { Telegraf } from "telegraf";
 import Database from "better-sqlite3";
 import axios from "axios";
@@ -176,7 +176,19 @@ const STABLECOINS = [
 ];
 
 const getErrorMessage = (error: any) => {
-  return error?.response?.data?.error || error?.response?.data?.message || error?.message || "Unknown error";
+  if (error instanceof SendTransactionError) {
+    const logs = error.logs ? error.logs.join("\n") : "No logs available";
+    if (logs.includes("0x1771") || logs.includes("6001")) {
+      return "Slippage tolerance exceeded (0x1771). The price moved too much during the swap.";
+    }
+    return `Transaction simulation failed: ${error.message}\nLogs:\n${logs}`;
+  }
+  
+  const msg = error?.response?.data?.error || error?.response?.data?.message || error?.message || "Unknown error";
+  if (typeof msg === 'string' && (msg.includes("0x1771") || msg.includes("6001"))) {
+    return "Slippage tolerance exceeded (0x1771). The price moved too much during the swap.";
+  }
+  return msg;
 };
 
 // Position Management
@@ -507,7 +519,7 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     transaction.message.recentBlockhash = latestBlockhash.blockhash;
     transaction.sign([keypair]);
     
-    console.log(`🚀 Sending transaction...`);
+    console.log(`🚀 Sending transaction with ${slippageBps / 100}% slippage...`);
     const txid = await currentConnection.sendRawTransaction(transaction.serialize(), {
       skipPreflight: false,
       maxRetries: 3
