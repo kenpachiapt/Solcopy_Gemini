@@ -446,9 +446,39 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
       console.log(`ℹ️ Buy amount empty, copying original transaction amount: ${buyAmountSol.toFixed(4)} SOL`);
     }
 
+    // Balance check and adjustment
+    const balance = await currentConnection.getBalance(traderPubkey);
+    const minSolReserve = parseFloat(settingsMap.min_sol_reserve || "0.02");
+    const availableSol = (balance / LAMPORTS_PER_SOL) - minSolReserve;
+
+    if (isBuy) {
+      if (buyAmountSol > availableSol) {
+        console.log(`⚠️ Insufficient balance for buy. Available: ${availableSol.toFixed(4)} SOL, Needed: ${buyAmountSol.toFixed(4)} SOL. Adjusting to available.`);
+        buyAmountSol = availableSol;
+      }
+      
+      const minTradeSol = parseFloat(settingsMap.min_trade_sol || "0.01");
+      if (buyAmountSol < minTradeSol) {
+        console.log(`⚠️ Adjusted buy amount (${buyAmountSol.toFixed(4)} SOL) is below min_trade_sol (${minTradeSol} SOL). Skipping.`);
+        return;
+      }
+    } else {
+      // For sells, ensure we have at least enough for fees
+      if (availableSol < 0.005) {
+        console.log(`⚠️ Extremely low SOL balance (${(balance / LAMPORTS_PER_SOL).toFixed(4)} SOL). Sell might fail due to fees.`);
+      }
+    }
+
     let slippageBps = 100; // Default 1%
     if (settingsMap.max_slippage && settingsMap.max_slippage.trim() !== "") {
       slippageBps = Math.floor(parseFloat(settingsMap.max_slippage) * 100);
+    }
+
+    // Increase slippage for sells to ensure execution as requested
+    if (!isBuy) {
+      const sellSlippageIncrease = 1000; // Add 10% extra slippage for sells
+      slippageBps += sellSlippageIncrease;
+      console.log(`ℹ️ Sell detected: Increased slippage to ${slippageBps / 100}% to ensure execution.`);
     }
 
     let prioritizationFeeLamports: number | "auto" = "auto";
