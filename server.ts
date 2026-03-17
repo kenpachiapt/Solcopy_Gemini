@@ -71,7 +71,21 @@ db.exec(`
     error_message TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
+`);
 
+// Migration: Add original_tx_hash if it doesn't exist
+try {
+  const columns = db.prepare("PRAGMA table_info(trades)").all() as any[];
+  const hasOriginalTxHash = columns.some(c => c.name === 'original_tx_hash');
+  if (!hasOriginalTxHash) {
+    db.prepare("ALTER TABLE trades ADD COLUMN original_tx_hash TEXT").run();
+    console.log("✅ Migration: Added original_tx_hash column to trades table");
+  }
+} catch (e) {
+  console.error("Migration error:", e);
+}
+
+db.exec(`
   CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -377,6 +391,9 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     return;
   }
 
+  let tokenMint = 'Unknown';
+  let isBuy = true;
+
   try {
     const keypair = Keypair.fromSecretKey(bs58.decode(tradingKey));
     const traderPubkey = keypair.publicKey;
@@ -398,14 +415,14 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     }
 
     let tokenChange = tokenChanges.find((tc: any) => !STABLECOINS.includes(tc.mint)) || tokenChanges[0];
-    const tokenMint = tokenChange.mint;
+    tokenMint = tokenChange.mint;
     
     const preEntry = preTokenBalances.find((p: any) => p.accountIndex === tokenChange.accountIndex);
     const preAmountRaw = new BigNumber(preEntry?.uiTokenAmount?.amount || "0");
     const postAmountRaw = new BigNumber(tokenChange.uiTokenAmount.amount);
     const decimals = tokenChange.uiTokenAmount.decimals;
     
-    const isBuy = postAmountRaw.gt(preAmountRaw);
+    isBuy = postAmountRaw.gt(preAmountRaw);
     console.log(`ℹ️ Detected ${isBuy ? "BUY" : "SELL"} for token: ${tokenMint}`);
 
     // Calculate Buy Amount
@@ -587,6 +604,24 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
   } catch (error) {
     console.error("Copy trade failed:", error);
     const errMsg = getErrorMessage(error);
+    
+    // Record failed trade
+    try {
+      db.prepare(`
+        INSERT INTO trades (
+          wallet_address, token_mint, side, status, error_message, original_tx_hash
+        ) VALUES (?, ?, ?, 'failed', ?, ?)
+      `).run(
+        walletAddress,
+        tokenMint,
+        isBuy ? 'buy' : 'sell',
+        errMsg,
+        originalSignature
+      );
+    } catch (dbErr) {
+      console.error("Failed to record failed trade in DB:", dbErr);
+    }
+
     await sendTelegramMessage(`❌ *Copy Trade Failed*\nError: ${errMsg}`);
   }
 };
