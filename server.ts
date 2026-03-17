@@ -23,6 +23,12 @@ const db = new Database("trading.db");
 // API Router Definition (Early)
 const apiRouter = express.Router();
 
+// Request Logger for API - Moved to top of router
+apiRouter.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] API ROUTER MATCH: ${req.method} ${req.url}`);
+  next();
+});
+
 // Global Middleware
 app.use(express.json());
 app.use((req, res, next) => {
@@ -35,7 +41,7 @@ app.use((req, res, next) => {
 });
 
 // Mount API Router early to ensure it takes precedence
-app.use("/api", apiRouter);
+// REMOVED FROM HERE - MOVED TO BOTTOM
 
 // Initialize Database
 db.exec(`
@@ -756,12 +762,6 @@ apiRouter.get("/positions", (req, res) => {
   }
 });
 
-// Request Logger for API
-apiRouter.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] API ROUTER MATCH: ${req.method} ${req.url}`);
-  next();
-});
-
 apiRouter.get("/wallets", (req, res) => {
   console.log(">>> Handling GET /api/wallets");
   try {
@@ -1017,10 +1017,11 @@ apiRouter.post("/settings", (req, res) => {
 // API 404 Handler
 apiRouter.all("*", (req, res) => {
   console.log(`>>> API 404: ${req.method} ${req.url}`);
-  res.status(404).json({ error: "API Route Not Found" });
+  res.status(404).json({ error: "API Route Not Found", path: req.url });
 });
 
-// Mount API Router immediately - ALREADY MOUNTED AT TOP
+// Final mounting of API router
+app.use("/api", apiRouter);
 
 // Vite Integration
 async function startServer() {
