@@ -93,7 +93,7 @@ export default function App() {
     telegram_token: "",
     telegram_chat_id: "",
     solana_rpc: "",
-    jupiter_api_url: "https://quote-api.jup.ag/v6/quote",
+    jupiter_api_url: "https://quote-api.jup.ag/v6",
     jupiter_api_key: ""
   });
 

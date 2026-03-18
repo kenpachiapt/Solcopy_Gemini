@@ -404,26 +404,41 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     
     console.log(`🔍 Analyzing token balances for ${walletAddress}...`);
 
-    const tokenChanges = postTokenBalances.filter((post: any) => {
-      const pre = preTokenBalances.find((p: any) => p.accountIndex === post.accountIndex);
-      return post.owner === walletAddress && (!pre || post.uiTokenAmount.amount !== pre.uiTokenAmount.amount);
-    });
+    const allMints = new Set([
+      ...preTokenBalances.filter((b: any) => b.owner === walletAddress).map((b: any) => b.mint),
+      ...postTokenBalances.filter((b: any) => b.owner === walletAddress).map((b: any) => b.mint)
+    ]);
+
+    const tokenChanges = Array.from(allMints).map(mint => {
+      const pre = preTokenBalances.find((b: any) => b.owner === walletAddress && b.mint === mint);
+      const post = postTokenBalances.find((b: any) => b.owner === walletAddress && b.mint === mint);
+      
+      const preAmount = new BigNumber(pre?.uiTokenAmount?.amount || "0");
+      const postAmount = new BigNumber(post?.uiTokenAmount?.amount || "0");
+      
+      return {
+        mint,
+        preAmount,
+        postAmount,
+        decimals: post?.uiTokenAmount?.decimals || pre?.uiTokenAmount?.decimals || 0
+      };
+    }).filter(change => !change.preAmount.eq(change.postAmount));
 
     if (tokenChanges.length === 0) {
       console.log("⚠️ No token balance changes found for this wallet. Skipping.");
       return;
     }
 
-    let tokenChange = tokenChanges.find((tc: any) => !STABLECOINS.includes(tc.mint)) || tokenChanges[0];
+    // Prioritize non-stable tokens
+    let tokenChange = tokenChanges.find(tc => !STABLECOINS.includes(tc.mint)) || tokenChanges[0];
     tokenMint = tokenChange.mint;
     
-    const preEntry = preTokenBalances.find((p: any) => p.accountIndex === tokenChange.accountIndex);
-    const preAmountRaw = new BigNumber(preEntry?.uiTokenAmount?.amount || "0");
-    const postAmountRaw = new BigNumber(tokenChange.uiTokenAmount.amount);
-    const decimals = tokenChange.uiTokenAmount.decimals;
+    const preAmountRaw = tokenChange.preAmount;
+    const postAmountRaw = tokenChange.postAmount;
+    const decimals = tokenChange.decimals;
     
     isBuy = postAmountRaw.gt(preAmountRaw);
-    console.log(`ℹ️ Detected ${isBuy ? "BUY" : "SELL"} for token: ${tokenMint}`);
+    console.log(`ℹ️ Detected ${isBuy ? "BUY" : "SELL"} for token: ${tokenMint} (Pre: ${preAmountRaw.toFixed()}, Post: ${postAmountRaw.toFixed()})`);
 
     // Calculate Buy Amount
     let buyAmountSol = 0.1; 
@@ -535,7 +550,7 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     console.log(`🎯 Executing ${isBuy ? "BUY" : "SELL"} | Token: ${tokenMint} | Amount: ${amountRawBN.toFixed(0)} raw units`);
 
     const jupApiKey = settingsMap.jupiter_api_key || process.env.JUPITER_API_KEY;
-    const jupBaseUrl = "https://api.jup.ag";
+    const jupBaseUrl = settingsMap.jupiter_api_url || "https://quote-api.jup.ag/v6";
 
     const headers: any = { 'Accept': 'application/json' };
     if (jupApiKey) headers['x-api-key'] = jupApiKey;
@@ -551,7 +566,15 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
         const currentSlippage = isBuy ? slippageBps : (slippageBps + (attempt - 1) * 100);
         finalSlippageUsed = currentSlippage;
 
-        const quoteUrl = `${jupBaseUrl}/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountRawBN.toFixed(0)}&slippageBps=${currentSlippage}`;
+        // Determine quote and swap URLs based on base URL
+        const quoteUrl = jupBaseUrl.includes("/v6") 
+          ? `${jupBaseUrl}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountRawBN.toFixed(0)}&slippageBps=${currentSlippage}`
+          : `${jupBaseUrl}/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountRawBN.toFixed(0)}&slippageBps=${currentSlippage}`;
+        
+        const swapUrl = jupBaseUrl.includes("/v6")
+          ? `${jupBaseUrl}/swap`
+          : `${jupBaseUrl}/swap/v1/swap`;
+
         console.log(`📡 Fetching quote (Attempt ${attempt}/${maxRetries}): ${quoteUrl}`);
 
         const quoteResponse = await axios.get(quoteUrl, { timeout: 10000, headers });
@@ -560,7 +583,7 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
           throw new Error("Invalid quote response from Jupiter");
         }
 
-        const swapResponse = await axios.post(`${jupBaseUrl}/swap/v1/swap`, {
+        const swapResponse = await axios.post(swapUrl, {
           quoteResponse: quoteResponse.data,
           userPublicKey: traderPubkey.toBase58(),
           wrapAndUnwrapSol: true,
@@ -707,7 +730,7 @@ const processTransaction = async (signature: string, walletAddress: string) => {
         throw new Error("Transaction not yet indexed");
       }
       return result;
-    }, 10, 2500); // 10 retries, 2.5s delay = 25s total
+    }, 15, 1000); // 15 retries, 1s delay = 15s total
 
     // Mark as processed
     db.prepare("INSERT OR IGNORE INTO processed_signatures (signature, wallet_address) VALUES (?, ?)").run(signature, walletAddress);
@@ -766,7 +789,8 @@ const processTransaction = async (signature: string, walletAddress: string) => {
   });
 
   // Fallback: Check if there are token balance changes for the wallet
-  const hasTokenChange = (tx.meta.postTokenBalances || []).some((b: any) => b.owner === walletAddress);
+  const hasTokenChange = (tx.meta.postTokenBalances || []).some((b: any) => b.owner === walletAddress) || 
+                         (tx.meta.preTokenBalances || []).some((b: any) => b.owner === walletAddress);
 
   if (isSwap || hasTokenChange) {
     console.log(`✅ Swap/Activity detected in ${signature}`);
