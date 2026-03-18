@@ -540,50 +540,74 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     const headers: any = { 'Accept': 'application/json' };
     if (jupApiKey) headers['x-api-key'] = jupApiKey;
 
-    const quoteUrl = `${jupBaseUrl}/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountRawBN.toFixed(0)}&slippageBps=${slippageBps}`;
-    console.log(`📡 Fetching quote: ${quoteUrl}`);
+    let txid = "";
+    let finalSlippageUsed = slippageBps;
+    const maxRetries = isBuy ? 1 : 5; // Retry up to 5 times for sells
+    let attempt = 0;
 
-    const quoteResponse = await axios.get(quoteUrl, { timeout: 10000, headers });
+    while (attempt < maxRetries) {
+      try {
+        attempt++;
+        const currentSlippage = isBuy ? slippageBps : (slippageBps + (attempt - 1) * 100);
+        finalSlippageUsed = currentSlippage;
 
-    if (!quoteResponse.data || !quoteResponse.data.outAmount) {
-      throw new Error("Invalid quote response from Jupiter");
+        const quoteUrl = `${jupBaseUrl}/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountRawBN.toFixed(0)}&slippageBps=${currentSlippage}`;
+        console.log(`📡 Fetching quote (Attempt ${attempt}/${maxRetries}): ${quoteUrl}`);
+
+        const quoteResponse = await axios.get(quoteUrl, { timeout: 10000, headers });
+
+        if (!quoteResponse.data || !quoteResponse.data.outAmount) {
+          throw new Error("Invalid quote response from Jupiter");
+        }
+
+        const swapResponse = await axios.post(`${jupBaseUrl}/swap/v1/swap`, {
+          quoteResponse: quoteResponse.data,
+          userPublicKey: traderPubkey.toBase58(),
+          wrapAndUnwrapSol: true,
+          dynamicComputeUnitLimit: true,
+          prioritizationFeeLamports
+        }, { timeout: 15000, headers });
+
+        if (!swapResponse.data?.swapTransaction) {
+          throw new Error("Failed to get swap transaction from Jupiter");
+        }
+
+        const transaction = VersionedTransaction.deserialize(Buffer.from(swapResponse.data.swapTransaction, 'base64'));
+        const latestBlockhash = await currentConnection.getLatestBlockhash("confirmed");
+        transaction.message.recentBlockhash = latestBlockhash.blockhash;
+        transaction.sign([keypair]);
+        
+        console.log(`🚀 Sending transaction with ${currentSlippage / 100}% slippage...`);
+        txid = await currentConnection.sendRawTransaction(transaction.serialize(), {
+          skipPreflight: false,
+          maxRetries: 3
+        });
+        
+        console.log(`⏳ Confirming: ${txid}`);
+        const confirmation = await currentConnection.confirmTransaction({
+          signature: txid,
+          blockhash: latestBlockhash.blockhash,
+          lastValidBlockHeight: latestBlockhash.lastValidBlockHeight
+        }, 'confirmed');
+
+        if (confirmation.value.err) {
+          throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
+        }
+
+        console.log(`✅ Confirmed: ${txid}`);
+        break; // Success, exit retry loop
+      } catch (error) {
+        const errMsg = getErrorMessage(error);
+        console.error(`❌ Attempt ${attempt} failed: ${errMsg}`);
+        
+        if (!isBuy && attempt < maxRetries) {
+          console.log(`🔄 Retrying sell in 2s with +1% slippage...`);
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
+        }
+        throw error; // Re-throw if buy or max retries reached
+      }
     }
-
-    const swapResponse = await axios.post(`${jupBaseUrl}/swap/v1/swap`, {
-      quoteResponse: quoteResponse.data,
-      userPublicKey: traderPubkey.toBase58(),
-      wrapAndUnwrapSol: true,
-      dynamicComputeUnitLimit: true,
-      prioritizationFeeLamports
-    }, { timeout: 15000, headers });
-
-    if (!swapResponse.data?.swapTransaction) {
-      throw new Error("Failed to get swap transaction from Jupiter");
-    }
-
-    const transaction = VersionedTransaction.deserialize(Buffer.from(swapResponse.data.swapTransaction, 'base64'));
-    const latestBlockhash = await currentConnection.getLatestBlockhash("confirmed");
-    transaction.message.recentBlockhash = latestBlockhash.blockhash;
-    transaction.sign([keypair]);
-    
-    console.log(`🚀 Sending transaction with ${slippageBps / 100}% slippage...`);
-    const txid = await currentConnection.sendRawTransaction(transaction.serialize(), {
-      skipPreflight: false,
-      maxRetries: 3
-    });
-    
-    console.log(`⏳ Confirming: ${txid}`);
-    const confirmation = await currentConnection.confirmTransaction({
-      signature: txid,
-      blockhash: latestBlockhash.blockhash,
-      lastValidBlockHeight: latestBlockhash.lastValidBlockHeight
-    }, 'confirmed');
-
-    if (confirmation.value.err) {
-      throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
-    }
-
-    console.log(`✅ Confirmed: ${txid}`);
 
     // Fetch final tx to get actual delta
     const finalTx = await currentConnection.getTransaction(txid, {
@@ -609,7 +633,7 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
       txid,
       originalSignature,
       (finalTx?.meta?.fee || 0) / LAMPORTS_PER_SOL,
-      slippageBps / 100
+      finalSlippageUsed / 100
     );
 
     // Update position
