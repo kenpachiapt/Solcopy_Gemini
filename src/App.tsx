@@ -97,6 +97,13 @@ export default function App() {
     jupiter_api_key: ""
   });
 
+  const [notification, setNotification] = useState<{ message: string, type: 'success' | 'error' } | null>(null);
+
+  const showNotification = (message: string, type: 'success' | 'error' = 'success') => {
+    setNotification({ message, type });
+    setTimeout(() => setNotification(null), 3000);
+  };
+
   const fetchData = async () => {
     try {
       const endpoints = [
@@ -147,10 +154,11 @@ export default function App() {
         body: JSON.stringify(settings)
       });
       if (res.ok) {
-        alert("Ayarlar başarıyla kaydedildi!");
+        showNotification("Ayarlar başarıyla kaydedildi!");
       }
     } catch (error) {
       console.error("Failed to save settings:", error);
+      showNotification("Ayarlar kaydedilirken hata oluştu!", "error");
     } finally {
       setLoading(false);
     }
@@ -184,12 +192,13 @@ export default function App() {
   };
 
   const deleteWallet = async (id: number) => {
-    if (!confirm("Bu cüzdanı takipten çıkarmak istediğinize emin misiniz?")) return;
     try {
       await fetch(`/api/wallets/${id}`, { method: "DELETE" });
       fetchData();
+      showNotification("Cüzdan başarıyla silindi!");
     } catch (error) {
       console.error("Failed to delete wallet:", error);
+      showNotification("Cüzdan silinirken hata oluştu!", "error");
     }
   };
 
@@ -301,6 +310,23 @@ export default function App() {
 
       {/* Main Content */}
       <main className="flex-1 flex flex-col overflow-hidden relative w-full">
+        {/* Floating Notification */}
+        {notification && (
+          <motion.div
+            initial={{ opacity: 0, y: 50 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 50 }}
+            className={`fixed bottom-8 left-1/2 -translate-x-1/2 px-6 py-3 rounded-xl shadow-2xl z-[100] flex items-center gap-3 border ${
+              notification.type === 'success' 
+                ? 'bg-[#14F195]/10 border-[#14F195]/30 text-[#14F195]' 
+                : 'bg-red-400/10 border-red-400/30 text-red-400'
+            }`}
+          >
+            <div className={`w-2 h-2 rounded-full ${notification.type === 'success' ? 'bg-[#14F195]' : 'bg-red-400'}`} />
+            <span className="text-xs font-bold uppercase tracking-widest">{notification.message}</span>
+          </motion.div>
+        )}
+
         {/* Top Header */}
         <header className="h-16 border-b border-white/5 flex items-center justify-between px-4 lg:px-8 bg-black/20 backdrop-blur-md sticky top-0 z-40">
           <div className="flex items-center gap-4 lg:gap-8">

@@ -404,14 +404,20 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     
     console.log(`🔍 Analyzing token balances for ${walletAddress}...`);
 
+    const accountKeys = originalTx.transaction.message.accountKeys;
+    const walletIndex = accountKeys.findIndex((k: any) => {
+      const pk = k.pubkey ? k.pubkey.toString() : k.toString();
+      return pk === walletAddress;
+    });
+
     const allMints = new Set([
-      ...preTokenBalances.filter((b: any) => b.owner === walletAddress).map((b: any) => b.mint),
-      ...postTokenBalances.filter((b: any) => b.owner === walletAddress).map((b: any) => b.mint)
+      ...preTokenBalances.filter((b: any) => b.owner === walletAddress || b.accountIndex === walletIndex).map((b: any) => b.mint),
+      ...postTokenBalances.filter((b: any) => b.owner === walletAddress || b.accountIndex === walletIndex).map((b: any) => b.mint)
     ]);
 
     const tokenChanges = Array.from(allMints).map(mint => {
-      const pre = preTokenBalances.find((b: any) => b.owner === walletAddress && b.mint === mint);
-      const post = postTokenBalances.find((b: any) => b.owner === walletAddress && b.mint === mint);
+      const pre = preTokenBalances.find((b: any) => (b.owner === walletAddress || b.accountIndex === walletIndex) && b.mint === mint);
+      const post = postTokenBalances.find((b: any) => (b.owner === walletAddress || b.accountIndex === walletIndex) && b.mint === mint);
       
       const preAmount = new BigNumber(pre?.uiTokenAmount?.amount || "0");
       const postAmount = new BigNumber(post?.uiTokenAmount?.amount || "0");
@@ -785,12 +791,20 @@ const processTransaction = async (signature: string, walletAddress: string) => {
            l.includes("lifinity") ||
            l.includes("fluxbeam") ||
            l.includes("phoenix") ||
-           l.includes("openbook");
+           l.includes("openbook") ||
+           l.includes("trade") ||
+           l.includes("liquidity");
   });
 
   // Fallback: Check if there are token balance changes for the wallet
-  const hasTokenChange = (tx.meta.postTokenBalances || []).some((b: any) => b.owner === walletAddress) || 
-                         (tx.meta.preTokenBalances || []).some((b: any) => b.owner === walletAddress);
+  const accountKeys = tx.transaction.message.accountKeys;
+  const walletIndex = accountKeys.findIndex((k: any) => {
+    const pk = k.pubkey ? k.pubkey.toString() : k.toString();
+    return pk === walletAddress;
+  });
+
+  const hasTokenChange = (tx.meta.postTokenBalances || []).some((b: any) => b.owner === walletAddress || b.accountIndex === walletIndex) || 
+                         (tx.meta.preTokenBalances || []).some((b: any) => b.owner === walletAddress || b.accountIndex === walletIndex);
 
   if (isSwap || hasTokenChange) {
     console.log(`✅ Swap/Activity detected in ${signature}`);
@@ -939,13 +953,8 @@ apiRouter.delete("/wallets/:id", (req, res) => {
   console.log(">>> Handling DELETE /api/wallets", req.params.id);
   const { id } = req.params;
   try {
-    const wallet = db.prepare("SELECT address FROM tracked_wallets WHERE id = ?").get(id) as { address: string };
-    if (wallet && activeSubscriptions.has(wallet.address)) {
-      const connection = getConnection();
-      connection.removeOnLogsListener(activeSubscriptions.get(wallet.address)!);
-      activeSubscriptions.delete(wallet.address);
-    }
     db.prepare("DELETE FROM tracked_wallets WHERE id = ?").run(id);
+    startMonitoring();
     res.json({ success: true });
   } catch (error) {
     console.error(">>> Error in DELETE /api/wallets:", error);
