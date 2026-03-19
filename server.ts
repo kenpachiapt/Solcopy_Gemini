@@ -430,20 +430,49 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
       };
     }).filter(change => !change.preAmount.eq(change.postAmount));
 
+    console.log("🧪 tokenChanges =", tokenChanges.map(tc => ({
+      mint: tc.mint,
+      pre: tc.preAmount.toFixed(),
+      post: tc.postAmount.toFixed(),
+      diff: tc.postAmount.minus(tc.preAmount).toFixed(),
+      decimals: tc.decimals
+    })));
+
     if (tokenChanges.length === 0) {
       console.log("⚠️ No token balance changes found for this wallet. Skipping.");
       return;
     }
 
-    // Prioritize non-stable tokens
-    let tokenChange = tokenChanges.find(tc => !STABLECOINS.includes(tc.mint)) || tokenChanges[0];
+    const nonStableChanges = tokenChanges.filter(tc => !STABLECOINS.includes(tc.mint));
+
+    const increased = nonStableChanges.filter(tc => tc.postAmount.gt(tc.preAmount));
+    const decreased = nonStableChanges.filter(tc => tc.postAmount.lt(tc.preAmount));
+
+    let tokenChange;
+
+    if (increased.length > 0 && decreased.length > 0) {
+      // Classic swap: increased token is BUY, decreased token is SELL
+      // If tracked wallet increased a non-stable token, we treat it as a BUY
+      tokenChange = increased.sort((a, b) => b.postAmount.minus(b.preAmount).comparedTo(a.postAmount.minus(a.preAmount)))[0];
+      isBuy = true;
+    } else if (decreased.length > 0) {
+      // Only decreased non-stable tokens: treat as SELL
+      tokenChange = decreased.sort((a, b) => b.preAmount.minus(b.postAmount).comparedTo(a.preAmount.minus(a.postAmount)))[0];
+      isBuy = false;
+    } else if (increased.length > 0) {
+      // Only increased non-stable tokens: treat as BUY
+      tokenChange = increased.sort((a, b) => b.postAmount.minus(b.preAmount).comparedTo(a.postAmount.minus(a.preAmount)))[0];
+      isBuy = true;
+    } else {
+      console.log("⚠️ No meaningful non-stable token change found.");
+      return;
+    }
+
     tokenMint = tokenChange.mint;
-    
     const preAmountRaw = tokenChange.preAmount;
     const postAmountRaw = tokenChange.postAmount;
     const decimals = tokenChange.decimals;
     
-    isBuy = postAmountRaw.gt(preAmountRaw);
     console.log(`ℹ️ Detected ${isBuy ? "BUY" : "SELL"} for token: ${tokenMint} (Pre: ${preAmountRaw.toFixed()}, Post: ${postAmountRaw.toFixed()})`);
 
     // Calculate Buy Amount
@@ -516,22 +545,6 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
       amountRawBN = new BigNumber(Math.floor(buyAmountSol * LAMPORTS_PER_SOL).toString());
     } else {
       // SELL logic: Check our own position
-      const position = getPosition(tokenMint);
-      if (!position || !position.is_active) {
-        console.log(`⚠️ No active position for ${tokenMint}, skipping sell.`);
-        return;
-      }
-
-      const positionRaw = new BigNumber(position.amount_raw || "0");
-      const sellPercent = parseFloat(settingsMap.sell_percent || "100");
-      amountRawBN = positionRaw.times(sellPercent).div(100).integerValue(BigNumber.ROUND_FLOOR);
-
-      if (amountRawBN.lte(0)) {
-        console.log("⚠️ Calculated sell amount is zero. Skipping.");
-        return;
-      }
-
-      // Double check actual wallet balance
       const traderTokenAccounts = await currentConnection.getParsedTokenAccountsByOwner(
         traderPubkey,
         { mint: new PublicKey(tokenMint) },
@@ -543,9 +556,25 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
         return sum.plus(raw);
       }, new BigNumber(0));
 
-      if (actualWalletRaw.lt(amountRawBN)) {
-        console.log(`⚠️ Actual balance (${actualWalletRaw.toFixed()}) is less than intended sell (${amountRawBN.toFixed()}). Adjusting.`);
-        amountRawBN = actualWalletRaw;
+      if (actualWalletRaw.lte(0)) {
+        console.log(`⚠️ Wallet has no balance for ${tokenMint}, skipping sell.`);
+        return;
+      }
+
+      const position = getPosition(tokenMint);
+      const sellPercent = parseFloat(settingsMap.sell_percent || "100");
+
+      if (position && position.is_active) {
+        const positionRaw = new BigNumber(position.amount_raw || "0");
+        amountRawBN = positionRaw.times(sellPercent).div(100).integerValue(BigNumber.ROUND_FLOOR);
+
+        if (actualWalletRaw.lt(amountRawBN)) {
+          amountRawBN = actualWalletRaw;
+        }
+      } else {
+        // DB position missing or inactive, but we have balance in wallet
+        amountRawBN = actualWalletRaw.times(sellPercent).div(100).integerValue(BigNumber.ROUND_FLOOR);
+        console.log(`⚠️ Position missing or inactive for ${tokenMint}, selling from actual wallet balance: ${amountRawBN.toFixed(0)}`);
       }
     }
 
@@ -818,6 +847,132 @@ const processTransaction = async (signature: string, walletAddress: string) => {
   }
 };
 
+const executeSell = async (tokenMint: string, amountRaw: string, decimals: number) => {
+  const settingsMap = getSettingsMap();
+  const tradingKey = settingsMap.trading_keypair || process.env.PRIVATE_KEY || process.env.TRADING_KEYPAIR;
+  if (!tradingKey) {
+    throw new Error("Trading keypair not set");
+  }
+
+  const keypair = Keypair.fromSecretKey(bs58.decode(tradingKey));
+  const traderPubkey = keypair.publicKey;
+  const currentConnection = getConnection();
+
+  console.log(`🎯 Executing SELL | Token: ${tokenMint} | Amount: ${amountRaw} raw units`);
+
+  const jupApiKey = settingsMap.jupiter_api_key || process.env.JUPITER_API_KEY;
+  const jupBaseUrl = settingsMap.jupiter_api_url || "https://quote-api.jup.ag/v6";
+  const headers: any = { 'Accept': 'application/json' };
+  if (jupApiKey) headers['x-api-key'] = jupApiKey;
+
+  const inputMint = tokenMint;
+  const outputMint = SOL_MINT;
+  const amountRawBN = new BigNumber(amountRaw);
+
+  let slippageBps = 1000; // Default 10% for stop loss to ensure execution
+  if (settingsMap.max_slippage && settingsMap.max_slippage.trim() !== "") {
+    slippageBps = Math.max(slippageBps, Math.floor(parseFloat(settingsMap.max_slippage) * 100));
+  }
+
+  let prioritizationFeeLamports: number | "auto" = "auto";
+  if (settingsMap.priority_fee && settingsMap.priority_fee.trim() !== "") {
+    prioritizationFeeLamports = Math.floor(parseFloat(settingsMap.priority_fee) * LAMPORTS_PER_SOL);
+  }
+
+  let txid = "";
+  const maxRetries = 5;
+  let attempt = 0;
+
+  while (attempt < maxRetries) {
+    try {
+      attempt++;
+      const currentSlippage = slippageBps + (attempt - 1) * 200; // Increase slippage on each retry
+
+      const quoteUrl = jupBaseUrl.includes("/v6") 
+        ? `${jupBaseUrl}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountRawBN.toFixed(0)}&slippageBps=${currentSlippage}`
+        : `${jupBaseUrl}/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountRawBN.toFixed(0)}&slippageBps=${currentSlippage}`;
+      
+      const swapUrl = jupBaseUrl.includes("/v6")
+        ? `${jupBaseUrl}/swap`
+        : `${jupBaseUrl}/swap/v1/swap`;
+
+      console.log(`📡 Fetching quote (Attempt ${attempt}/${maxRetries}): ${quoteUrl}`);
+      const quoteResponse = await axios.get(quoteUrl, { timeout: 10000, headers });
+
+      if (!quoteResponse.data || !quoteResponse.data.outAmount) {
+        throw new Error("Invalid quote response from Jupiter");
+      }
+
+      const swapResponse = await axios.post(swapUrl, {
+        quoteResponse: quoteResponse.data,
+        userPublicKey: traderPubkey.toBase58(),
+        wrapAndUnwrapSol: true,
+        dynamicComputeUnitLimit: true,
+        prioritizationFeeLamports
+      }, { timeout: 15000, headers });
+
+      if (!swapResponse.data?.swapTransaction) {
+        throw new Error("Failed to get swap transaction from Jupiter");
+      }
+
+      const transaction = VersionedTransaction.deserialize(Buffer.from(swapResponse.data.swapTransaction, 'base64'));
+      const latestBlockhash = await currentConnection.getLatestBlockhash("confirmed");
+      transaction.message.recentBlockhash = latestBlockhash.blockhash;
+      transaction.sign([keypair]);
+      
+      console.log(`🚀 Sending transaction with ${currentSlippage / 100}% slippage...`);
+      txid = await currentConnection.sendRawTransaction(transaction.serialize(), {
+        skipPreflight: false,
+        maxRetries: 3
+      });
+      
+      console.log(`⏳ Confirming: ${txid}`);
+      const confirmation = await currentConnection.confirmTransaction({
+        signature: txid,
+        blockhash: latestBlockhash.blockhash,
+        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight
+      }, 'confirmed');
+
+      if (confirmation.value.err) {
+        throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
+      }
+
+      console.log(`✅ Confirmed: ${txid}`);
+      break;
+    } catch (error) {
+      const errMsg = getErrorMessage(error);
+      console.error(`❌ Attempt ${attempt} failed: ${errMsg}`);
+      if (attempt < maxRetries) {
+        await sleep(2000);
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  // Record trade and update position
+  db.prepare(`
+    INSERT INTO trades (
+      wallet_address, token_mint, side, status, tx_hash, fee, slippage
+    ) VALUES (?, ?, 'sell', 'completed', ?, ?, ?)
+  `).run(
+    'SYSTEM_STOP_LOSS',
+    tokenMint,
+    txid,
+    0.000005, // Placeholder fee
+    slippageBps / 100
+  );
+
+  updatePositionAfterSell({
+    tokenMint,
+    soldRaw: amountRaw,
+    txid
+  });
+
+  await sendTelegramMessage(`✅ *Stop Loss Sell Executed!*\nToken: \`${tokenMint}\`\nTX: [Solscan](https://solscan.io/tx/${txid})`);
+  return txid;
+};
+
 // Trailing Stop Loss Logic
 const checkStopLoss = async () => {
   const positions = db.prepare("SELECT * FROM positions WHERE is_active = 1").all() as any[];
@@ -834,9 +989,14 @@ const checkStopLoss = async () => {
         if (dropPercent >= pos.stop_loss_percent) {
           console.log(`Stop loss triggered for ${pos.token_symbol} at ${currentPrice}`);
           await sendTelegramMessage(`⚠️ *Stop Loss Triggered!*\nToken: ${pos.token_symbol}\nPrice: ${currentPrice}\nDrop: ${dropPercent.toFixed(2)}%`);
-          // Execute sell logic here
-          // await executeSell(pos.token_mint, pos.amount);
-          db.prepare("UPDATE positions SET is_active = 0 WHERE id = ?").run(pos.id);
+          
+          // Execute sell logic
+          try {
+            await executeSell(pos.token_mint, pos.amount_raw, pos.decimals);
+            db.prepare("UPDATE positions SET is_active = 0 WHERE id = ?").run(pos.id);
+          } catch (sellErr) {
+            console.error(`Failed to execute stop loss sell for ${pos.token_mint}:`, sellErr);
+          }
         }
       }
     } catch (error) {
