@@ -74,6 +74,12 @@ const chartData = [
 
 export default function App() {
   const [activeTab, setActiveTab] = useState("dashboard");
+  const activeTabRef = React.useRef(activeTab);
+
+  useEffect(() => {
+    activeTabRef.current = activeTab;
+  }, [activeTab]);
+
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [wallets, setWallets] = useState<TrackedWallet[]>([]);
   const [trades, setTrades] = useState<Trade[]>([]);
@@ -96,6 +102,7 @@ export default function App() {
     jupiter_api_url: "https://quote-api.jup.ag/v6",
     jupiter_api_key: ""
   });
+  const [localSettings, setLocalSettings] = useState(settings);
 
   const [notification, setNotification] = useState<{ message: string, type: 'success' | 'error' } | null>(null);
 
@@ -115,7 +122,14 @@ export default function App() {
         }},
         { name: "settings", url: "/api/settings", setter: (data: any) => {
           if (Object.keys(data).length > 0) {
-            setSettings(prev => ({ ...prev, ...data }));
+            setSettings(prev => {
+              const newSettings = { ...prev, ...data };
+              // Use ref to avoid stale closure
+              if (activeTabRef.current !== "settings") {
+                setLocalSettings(newSettings);
+              }
+              return newSettings;
+            });
             if (data.bot_enabled !== undefined) setBotEnabled(data.bot_enabled === "true");
           }
         }},
@@ -151,9 +165,10 @@ export default function App() {
       const res = await fetch("/api/settings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(settings)
+        body: JSON.stringify(localSettings)
       });
       if (res.ok) {
+        setSettings(localSettings);
         showNotification("Ayarlar başarıyla kaydedildi!");
       }
     } catch (error) {
@@ -163,6 +178,13 @@ export default function App() {
       setLoading(false);
     }
   };
+
+  // Sync localSettings when switching to settings tab if they are different
+  useEffect(() => {
+    if (activeTab === "settings") {
+      setLocalSettings(settings);
+    }
+  }, [activeTab]);
 
   useEffect(() => {
     fetchData();
@@ -376,9 +398,11 @@ export default function App() {
           </div>
         </header>
 
-        {/* Scrollable Area */}
-        <div className="flex-1 overflow-y-auto p-4 lg:p-8 custom-scrollbar">
-          <AnimatePresence mode="wait">
+        {/* Main Body Area */}
+        <div className="flex-1 flex overflow-hidden">
+          {/* Scrollable Content Area */}
+          <div className="flex-1 overflow-y-auto p-4 lg:p-8 custom-scrollbar">
+            <AnimatePresence mode="wait">
             {activeTab === "dashboard" && (
               <motion.div
                 key="dashboard"
@@ -432,7 +456,11 @@ export default function App() {
                     </div>
                     <div className="flex-1 w-full">
                       <ResponsiveContainer width="100%" height="100%">
-                        <AreaChart data={chartData}>
+                        <AreaChart data={trades.length > 0 ? trades.slice().reverse().map((t, i) => ({
+                          time: new Date(t.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                          price: t.amount_sol || 0,
+                          side: t.side
+                        })) : chartData}>
                           <defs>
                             <linearGradient id="colorPrice" x1="0" y1="0" x2="0" y2="1">
                               <stop offset="5%" stopColor="#14F195" stopOpacity={0.3}/>
@@ -452,7 +480,6 @@ export default function App() {
                             fontSize={10} 
                             tickLine={false} 
                             axisLine={false}
-                            domain={['dataMin - 5', 'dataMax + 5']}
                           />
                           <Tooltip 
                             contentStyle={{ backgroundColor: '#151518', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '12px' }}
@@ -807,25 +834,85 @@ export default function App() {
                 initial={{ opacity: 0, y: 20 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -20 }}
-                className="space-y-6"
+                className="space-y-8 pb-20"
               >
-                <h2 className="text-2xl font-bold mb-8">Analizler</h2>
+                <div className="flex items-center justify-between">
+                  <h2 className="text-2xl font-bold">Analizler</h2>
+                  <div className="flex gap-2">
+                    <button className="px-4 py-2 bg-[#14F195] text-black font-bold rounded-xl text-xs">GÜNLÜK</button>
+                    <button className="px-4 py-2 bg-white/5 text-gray-400 font-bold rounded-xl text-xs">HAFTALIK</button>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                  <div className="glass-card p-6 rounded-2xl border-b-2 border-b-[#14F195]">
+                    <p className="text-[10px] text-gray-500 uppercase font-bold mb-1">Başarı Oranı</p>
+                    <h3 className="text-2xl font-bold font-mono text-[#14F195]">
+                      {trades.length > 0 ? ((trades.filter(t => t.status === 'completed' || t.status === 'success').length / trades.length) * 100).toFixed(1) : "0"}%
+                    </h3>
+                  </div>
+                  <div className="glass-card p-6 rounded-2xl border-b-2 border-b-[#9945FF]">
+                    <p className="text-[10px] text-gray-500 uppercase font-bold mb-1">Ortalama İşlem Boyutu</p>
+                    <h3 className="text-2xl font-bold font-mono text-[#9945FF]">
+                      {trades.length > 0 ? (trades.reduce((acc, t) => acc + (Number(t.amount_sol) || 0), 0) / trades.length).toFixed(3) : "0"} SOL
+                    </h3>
+                  </div>
+                  <div className="glass-card p-6 rounded-2xl border-b-2 border-b-blue-400">
+                    <p className="text-[10px] text-gray-500 uppercase font-bold mb-1">Toplam İşlem Sayısı</p>
+                    <h3 className="text-2xl font-bold font-mono text-blue-400">{trades.length}</h3>
+                  </div>
+                </div>
+
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
                   <div className="glass-card p-6 rounded-2xl">
-                    <h3 className="text-xs font-bold uppercase tracking-widest mb-6">Kar/Zarar Dağılımı</h3>
-                    <div className="h-64 flex items-center justify-center text-gray-500 italic text-sm">
-                      Veri toplanıyor...
+                    <h3 className="text-xs font-bold uppercase tracking-widest mb-6 flex items-center gap-2">
+                      <TrendingUp className="w-4 h-4 text-[#14F195]" />
+                      Kar/Zarar Dağılımı
+                    </h3>
+                    <div className="h-64 w-full">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <AreaChart data={trades.length > 0 ? trades.slice(0, 10).reverse().map((t, i) => ({
+                          name: i,
+                          pnl: t.side === 'buy' ? -(Number(t.amount_sol) || 0) : (Number(t.amount_sol) || 0)
+                        })) : [{name: 0, pnl: 0}]}>
+                          <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
+                          <XAxis dataKey="name" hide />
+                          <YAxis stroke="rgba(255,255,255,0.3)" fontSize={10} />
+                          <Tooltip 
+                            contentStyle={{ backgroundColor: '#151518', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '12px' }}
+                          />
+                          <Area type="monotone" dataKey="pnl" stroke="#14F195" fill="#14F195" fillOpacity={0.1} />
+                        </AreaChart>
+                      </ResponsiveContainer>
                     </div>
                   </div>
                   <div className="glass-card p-6 rounded-2xl">
-                    <h3 className="text-xs font-bold uppercase tracking-widest mb-6">En Çok İşlem Yapılan Tokenlar</h3>
+                    <h3 className="text-xs font-bold uppercase tracking-widest mb-6 flex items-center gap-2">
+                      <Zap className="w-4 h-4 text-[#9945FF]" />
+                      En Çok İşlem Yapılan Tokenlar
+                    </h3>
                     <div className="space-y-4">
-                      {trades.slice(0, 5).map((t, i) => (
-                        <div key={i} className="flex items-center justify-between p-3 bg-white/5 rounded-xl">
-                          <span className="text-xs font-mono">{t.token_mint.slice(0, 8)}...</span>
-                          <span className="text-xs font-bold text-[#14F195]">{t.amount_sol.toFixed(2)} SOL</span>
+                      {trades.length > 0 ? Object.entries(trades.reduce((acc: any, t) => {
+                        const key = t.token_symbol || (t.token_mint ? t.token_mint.slice(0, 8) : "Unknown");
+                        acc[key] = (acc[key] || 0) + 1;
+                        return acc;
+                      }, {})).sort((a: any, b: any) => b[1] - a[1]).slice(0, 5).map(([symbol, count]: any, i) => (
+                        <div key={i} className="flex items-center justify-between p-4 bg-white/5 rounded-xl border border-white/5">
+                          <div className="flex items-center gap-3">
+                            <div className="w-8 h-8 rounded-lg bg-white/10 flex items-center justify-center font-bold text-xs">
+                              {symbol[0]}
+                            </div>
+                            <span className="text-sm font-bold">{symbol}</span>
+                          </div>
+                          <div className="text-right">
+                            <span className="text-xs font-bold text-[#14F195]">{count} İşlem</span>
+                          </div>
                         </div>
-                      ))}
+                      )) : (
+                        <div className="h-40 flex items-center justify-center text-gray-500 italic text-sm">
+                          Henüz işlem verisi yok...
+                        </div>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -879,8 +966,8 @@ export default function App() {
                         <input 
                           type="text" 
                           placeholder="Boş = Hedefden Kopyala"
-                          value={settings.buy_amount} 
-                          onChange={(e) => setSettings({...settings, buy_amount: e.target.value})}
+                          value={localSettings.buy_amount} 
+                          onChange={(e) => setLocalSettings({...localSettings, buy_amount: e.target.value})}
                           className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#14F195]/50" 
                         />
                       </div>
@@ -889,8 +976,8 @@ export default function App() {
                         <input 
                           type="text" 
                           placeholder="Boş = Cüzdandan Kopyala"
-                          value={settings.max_slippage} 
-                          onChange={(e) => setSettings({...settings, max_slippage: e.target.value})}
+                          value={localSettings.max_slippage} 
+                          onChange={(e) => setLocalSettings({...localSettings, max_slippage: e.target.value})}
                           className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#14F195]/50" 
                         />
                       </div>
@@ -898,8 +985,8 @@ export default function App() {
                         <label className="text-[10px] text-gray-500 uppercase font-bold">Takip Eden Zarar Durdur (%)</label>
                         <input 
                           type="number" 
-                          value={settings.stop_loss} 
-                          onChange={(e) => setSettings({...settings, stop_loss: e.target.value})}
+                          value={localSettings.stop_loss} 
+                          onChange={(e) => setLocalSettings({...localSettings, stop_loss: e.target.value})}
                           className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#14F195]/50" 
                         />
                       </div>
@@ -908,8 +995,8 @@ export default function App() {
                         <input 
                           type="text" 
                           placeholder="Boş = Cüzdandan Kopyala"
-                          value={settings.priority_fee} 
-                          onChange={(e) => setSettings({...settings, priority_fee: e.target.value})}
+                          value={localSettings.priority_fee} 
+                          onChange={(e) => setLocalSettings({...localSettings, priority_fee: e.target.value})}
                           className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#14F195]/50" 
                         />
                       </div>
@@ -923,8 +1010,8 @@ export default function App() {
                         <input 
                           type="text" 
                           placeholder="https://api.mainnet-beta.solana.com"
-                          value={settings.solana_rpc} 
-                          onChange={(e) => setSettings({...settings, solana_rpc: e.target.value})}
+                          value={localSettings.solana_rpc} 
+                          onChange={(e) => setLocalSettings({...localSettings, solana_rpc: e.target.value})}
                           className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#14F195]/50" 
                         />
                       </div>
@@ -933,8 +1020,8 @@ export default function App() {
                         <input 
                           type="text" 
                           placeholder="https://quote-api.jup.ag/v6/quote"
-                          value={settings.jupiter_api_url} 
-                          onChange={(e) => setSettings({...settings, jupiter_api_url: e.target.value})}
+                          value={localSettings.jupiter_api_url} 
+                          onChange={(e) => setLocalSettings({...localSettings, jupiter_api_url: e.target.value})}
                           className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#14F195]/50" 
                         />
                       </div>
@@ -943,8 +1030,8 @@ export default function App() {
                         <input 
                           type="password" 
                           placeholder="API Anahtarınız (401 hatası alıyorsanız gereklidir)"
-                          value={settings.jupiter_api_key} 
-                          onChange={(e) => setSettings({...settings, jupiter_api_key: e.target.value})}
+                          value={localSettings.jupiter_api_key} 
+                          onChange={(e) => setLocalSettings({...localSettings, jupiter_api_key: e.target.value})}
                           className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#14F195]/50" 
                         />
                       </div>
@@ -953,8 +1040,8 @@ export default function App() {
                         <input 
                           type="password" 
                           placeholder="Base58 Özel Anahtar"
-                          value={settings.trading_keypair} 
-                          onChange={(e) => setSettings({...settings, trading_keypair: e.target.value})}
+                          value={localSettings.trading_keypair} 
+                          onChange={(e) => setLocalSettings({...localSettings, trading_keypair: e.target.value})}
                           className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#14F195]/50 font-mono" 
                         />
                       </div>
@@ -964,8 +1051,8 @@ export default function App() {
                           <input 
                             type="password" 
                             placeholder="Bot Jetonu"
-                            value={settings.telegram_token} 
-                            onChange={(e) => setSettings({...settings, telegram_token: e.target.value})}
+                            value={localSettings.telegram_token} 
+                            onChange={(e) => setLocalSettings({...localSettings, telegram_token: e.target.value})}
                             className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#14F195]/50" 
                           />
                         </div>
@@ -974,8 +1061,8 @@ export default function App() {
                           <input 
                             type="text" 
                             placeholder="Sohbet Kimliği"
-                            value={settings.telegram_chat_id} 
-                            onChange={(e) => setSettings({...settings, telegram_chat_id: e.target.value})}
+                            value={localSettings.telegram_chat_id} 
+                            onChange={(e) => setLocalSettings({...localSettings, telegram_chat_id: e.target.value})}
                             className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#14F195]/50" 
                           />
                         </div>
@@ -993,25 +1080,42 @@ export default function App() {
               </motion.div>
             )}
           </AnimatePresence>
-        </div>
+          </div>
 
-        {/* Floating Live Feed (Desktop Only) */}
-        <div className="hidden 2xl:block absolute right-8 top-24 w-64 space-y-4">
-          <div className="glass-card p-4 rounded-2xl">
-            <h3 className="text-[10px] font-bold uppercase tracking-widest text-gray-500 mb-4 flex items-center gap-2">
-              <Activity className="w-3 h-3 text-[#14F195]" />
-              Canlı Ağ Akışı
-            </h3>
-            <div className="space-y-4">
-              {[1, 2, 3].map(i => (
-                <div key={i} className="flex gap-3 text-[10px]">
-                  <div className="w-1 h-8 bg-white/5 rounded-full" />
-                  <div>
-                    <p className="text-gray-300 font-bold">Yeni Token Algılandı</p>
-                    <p className="text-gray-500 font-mono">Pump.fun • 2s önce</p>
+          {/* Floating Live Feed (Desktop Only) */}
+          <div className="hidden xl:block w-80 border-l border-white/5 bg-[#0D0D0F] overflow-y-auto custom-scrollbar">
+            <div className="p-6">
+              <h3 className="text-[10px] font-bold uppercase tracking-widest text-gray-500 mb-6 flex items-center gap-2">
+                <Activity className="w-3 h-3 text-[#14F195]" />
+                Canlı Ağ Akışı
+              </h3>
+              <div className="space-y-6">
+                {trades.length > 0 ? trades.slice(0, 10).map((t, i) => (
+                  <div key={i} className="flex gap-4 group">
+                    <div className={`w-1 h-12 rounded-full transition-colors ${t.side === 'buy' ? 'bg-[#14F195]' : 'bg-red-400'}`} />
+                    <div className="flex-1">
+                      <div className="flex items-center justify-between mb-1">
+                        <p className={`text-[10px] font-bold ${t.side === 'buy' ? 'text-[#14F195]' : 'text-red-400'}`}>
+                          {t.side === 'buy' ? 'ALIŞ İŞLEMİ' : 'SATIŞ İŞLEMİ'}
+                        </p>
+                        <span className="text-[8px] text-gray-600 font-mono">{new Date(t.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                      </div>
+                      <p className="text-xs font-bold text-gray-300 truncate">{t.token_symbol || (t.token_mint ? t.token_mint.slice(0, 8) : "Unknown")}</p>
+                      <p className="text-[10px] text-gray-500 font-mono mt-0.5">{Number(t.amount_sol).toFixed(3)} SOL</p>
+                    </div>
                   </div>
-                </div>
-              ))}
+                )) : (
+                  [1, 2, 3, 4, 5].map(i => (
+                    <div key={i} className="flex gap-4 opacity-20">
+                      <div className="w-1 h-12 bg-white/10 rounded-full" />
+                      <div>
+                        <div className="h-3 w-24 bg-white/10 rounded mb-2" />
+                        <div className="h-2 w-16 bg-white/10 rounded" />
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
             </div>
           </div>
         </div>

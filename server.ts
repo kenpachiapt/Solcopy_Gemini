@@ -192,15 +192,29 @@ const STABLECOINS = [
 const getErrorMessage = (error: any) => {
   if (error instanceof SendTransactionError) {
     const logs = error.logs ? error.logs.join("\n") : "No logs available";
-    if (logs.includes("0x1771") || logs.includes("6001")) {
-      return "Slippage tolerance exceeded (0x1771). The price moved too much during the swap.";
+    if (logs.includes("0x1771") || logs.includes("6001") || logs.includes("Custom\":1")) {
+      return "Kayma (Slippage) toleransı aşıldı. Fiyat çok hızlı değişti.";
     }
-    return `Transaction simulation failed: ${error.message}\nLogs:\n${logs}`;
+    if (logs.includes("0x1") || logs.includes("Insufficient funds")) {
+      return "Yetersiz bakiye. İşlem için yeterli SOL veya token bulunmuyor.";
+    }
+    if (logs.includes("Blockhash not found")) {
+      return "Blockhash bulunamadı veya süresi doldu. Lütfen tekrar deneyin.";
+    }
+    return `İşlem simülasyonu başarısız: ${error.message}\nLoglar:\n${logs}`;
   }
   
-  const msg = error?.response?.data?.error || error?.response?.data?.message || error?.message || "Unknown error";
-  if (typeof msg === 'string' && (msg.includes("0x1771") || msg.includes("6001"))) {
-    return "Slippage tolerance exceeded (0x1771). The price moved too much during the swap.";
+  const msg = error?.response?.data?.error || error?.response?.data?.message || error?.message || "Bilinmeyen hata";
+  if (typeof msg === 'string') {
+    if (msg.includes("0x1771") || msg.includes("6001") || msg.includes("Custom\":1")) {
+      return "Kayma (Slippage) toleransı aşıldı. Fiyat çok hızlı değişti.";
+    }
+    if (msg.includes("0x1") || msg.includes("Insufficient funds") || msg.includes("insufficient funds")) {
+      return "Yetersiz bakiye. İşlem için yeterli SOL veya token bulunmuyor.";
+    }
+    if (msg.includes("Blockhash not found")) {
+      return "Blockhash bulunamadı veya süresi doldu.";
+    }
   }
   return msg;
 };
@@ -631,7 +645,16 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
         }
 
         const transaction = VersionedTransaction.deserialize(Buffer.from(swapResponse.data.swapTransaction, 'base64'));
-        const latestBlockhash = await currentConnection.getLatestBlockhash("confirmed");
+        
+        // Fetch blockhash with retry
+        let latestBlockhash;
+        try {
+          latestBlockhash = await currentConnection.getLatestBlockhash("confirmed");
+        } catch (bhErr) {
+          console.log("⚠️ Failed to get confirmed blockhash, trying finalized...");
+          latestBlockhash = await currentConnection.getLatestBlockhash("finalized");
+        }
+        
         transaction.message.recentBlockhash = latestBlockhash.blockhash;
         transaction.sign([keypair]);
         
@@ -711,31 +734,40 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
       });
     }
 
-    await sendTelegramMessage(`✅ *Trade Executed!*\nSide: ${isBuy ? "BUY" : "SELL"}\nToken: \`${tokenMint}\`\nTX: [Solscan](https://solscan.io/tx/${txid})`);
-
-  } catch (error) {
-    console.error("Copy trade failed:", error);
-    const errMsg = getErrorMessage(error);
-    
-    // Record failed trade
-    try {
-      db.prepare(`
-        INSERT INTO trades (
-          wallet_address, token_mint, side, status, error_message, original_tx_hash
-        ) VALUES (?, ?, ?, 'failed', ?, ?)
-      `).run(
-        walletAddress,
-        tokenMint,
-        isBuy ? 'buy' : 'sell',
-        errMsg,
-        originalSignature
-      );
-    } catch (dbErr) {
-      console.error("Failed to record failed trade in DB:", dbErr);
+    if (isBuy) {
+      await sendTelegramMessage(`🟢 *ALIM EMRİ GERÇEKLEŞTİ*\n\nToken: \`${tokenMint}\`\nMiktar: ${amountRawBN.toNumber() / LAMPORTS_PER_SOL} SOL\nTX: [Solscan](https://solscan.io/tx/${txid})`);
+    } else {
+      await sendTelegramMessage(`🔴 *SATIŞ EMRİ GERÇEKLEŞTİ*\n\nToken: \`${tokenMint}\`\nMiktar: ${amountRawBN.toFixed(0)} birim\nTX: [Solscan](https://solscan.io/tx/${txid})`);
     }
-
-    await sendTelegramMessage(`❌ *Copy Trade Failed*\nError: ${errMsg}`);
+  } catch (error) {
+  console.error("Copy trade failed:", error);
+  const errMsg = getErrorMessage(error);
+  
+  // Record failed trade
+  try {
+    db.prepare(`
+      INSERT INTO trades (
+        wallet_address, token_mint, side, status, error_message, original_tx_hash
+      ) VALUES (?, ?, ?, 'failed', ?, ?)
+    `).run(
+      walletAddress,
+      tokenMint,
+      isBuy ? 'buy' : 'sell',
+      errMsg,
+      originalSignature
+    );
+  } catch (dbErr) {
+    console.error("Failed to record failed trade in DB:", dbErr);
   }
+
+  // Only notify on critical failures, not for "insufficient balance" or "no balance to sell"
+  const silentErrors = ["Yetersiz bakiye", "Insufficient balance", "no balance for", "Insufficient funds", "insufficient funds"];
+  const shouldNotify = !silentErrors.some(err => errMsg.includes(err));
+
+  if (shouldNotify) {
+    await sendTelegramMessage(`❌ *İŞLEM BAŞARISIZ*\n\nTür: ${isBuy ? "ALIM" : "SATIŞ"}\nToken: \`${tokenMint}\`\nHata: ${errMsg}`);
+  }
+}
 };
 
 const processTransaction = async (signature: string, walletAddress: string) => {
@@ -837,8 +869,7 @@ const processTransaction = async (signature: string, walletAddress: string) => {
 
   if (isSwap || hasTokenChange) {
     console.log(`✅ Swap/Activity detected in ${signature}`);
-    const fee = tx.meta.fee / LAMPORTS_PER_SOL;
-    await sendTelegramMessage(`🚀 *New Swap Detected!*\nWallet: \`${walletAddress}\`\nTX: [View on Solscan](https://solscan.io/tx/${signature})\nFee: ${fee} SOL`);
+    // Removed redundant Telegram message here to only notify on actual trade execution
     
     // Execute the copy trade
     await executeCopyTrade(tx, walletAddress, currentConnection, signature);
@@ -916,7 +947,16 @@ const executeSell = async (tokenMint: string, amountRaw: string, decimals: numbe
       }
 
       const transaction = VersionedTransaction.deserialize(Buffer.from(swapResponse.data.swapTransaction, 'base64'));
-      const latestBlockhash = await currentConnection.getLatestBlockhash("confirmed");
+      
+      // Fetch blockhash with retry
+      let latestBlockhash;
+      try {
+        latestBlockhash = await currentConnection.getLatestBlockhash("confirmed");
+      } catch (bhErr) {
+        console.log("⚠️ Failed to get confirmed blockhash, trying finalized...");
+        latestBlockhash = await currentConnection.getLatestBlockhash("finalized");
+      }
+      
       transaction.message.recentBlockhash = latestBlockhash.blockhash;
       transaction.sign([keypair]);
       
@@ -969,7 +1009,7 @@ const executeSell = async (tokenMint: string, amountRaw: string, decimals: numbe
     txid
   });
 
-  await sendTelegramMessage(`✅ *Stop Loss Sell Executed!*\nToken: \`${tokenMint}\`\nTX: [Solscan](https://solscan.io/tx/${txid})`);
+  await sendTelegramMessage(`🔴 *STOP LOSS SATIŞI GERÇEKLEŞTİ*\n\nToken: \`${tokenMint}\`\nTX: [Solscan](https://solscan.io/tx/${txid})`);
   return txid;
 };
 
