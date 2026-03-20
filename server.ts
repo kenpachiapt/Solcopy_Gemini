@@ -1354,11 +1354,11 @@ apiRouter.all("*", (req, res) => {
   res.status(404).json({ error: "API Route Not Found", path: req.url });
 });
 
-// Final mounting of API router
-app.use("/api", apiRouter);
-
 // Vite Integration
 async function startServer() {
+  // Mount API Router early to ensure it takes precedence over SPA fallback
+  app.use("/api", apiRouter);
+
   // Vite Integration
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
