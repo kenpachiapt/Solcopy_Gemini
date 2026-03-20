@@ -398,6 +398,8 @@ const startMonitoring = async () => {
 // Copy trade logic
 const executeCopyTrade = async (originalTx: any, walletAddress: string, currentConnection: Connection, originalSignature: string) => {
   const settingsMap = getSettingsMap();
+  const walletInfo = db.prepare("SELECT label FROM tracked_wallets WHERE address = ?").get(walletAddress) as { label: string } | undefined;
+  const walletLabel = walletInfo?.label || walletAddress;
 
   const tradingKey = settingsMap.trading_keypair || process.env.PRIVATE_KEY || process.env.TRADING_KEYPAIR;
   if (!tradingKey) {
@@ -735,9 +737,9 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     }
 
     if (isBuy) {
-      await sendTelegramMessage(`🟢 *ALIM EMRİ GERÇEKLEŞTİ*\n\nToken: \`${tokenMint}\`\nMiktar: ${amountRawBN.toNumber() / LAMPORTS_PER_SOL} SOL\nTX: [Solscan](https://solscan.io/tx/${txid})`);
+      await sendTelegramMessage(`🟢 *ALIM EMRİ GERÇEKLEŞTİ*\n\nCüzdan: \`${walletLabel}\`\nToken: \`${tokenMint}\`\nMiktar: ${amountRawBN.toNumber() / LAMPORTS_PER_SOL} SOL\nTX: [Solscan](https://solscan.io/tx/${txid})`);
     } else {
-      await sendTelegramMessage(`🔴 *SATIŞ EMRİ GERÇEKLEŞTİ*\n\nToken: \`${tokenMint}\`\nMiktar: ${amountRawBN.toFixed(0)} birim\nTX: [Solscan](https://solscan.io/tx/${txid})`);
+      await sendTelegramMessage(`🔴 *SATIŞ EMRİ GERÇEKLEŞTİ*\n\nCüzdan: \`${walletLabel}\`\nToken: \`${tokenMint}\`\nMiktar: ${amountRawBN.toFixed(0)} birim\nTX: [Solscan](https://solscan.io/tx/${txid})`);
     }
   } catch (error) {
   console.error("Copy trade failed:", error);
@@ -765,7 +767,7 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
   const shouldNotify = !silentErrors.some(err => errMsg.includes(err));
 
   if (shouldNotify) {
-    await sendTelegramMessage(`❌ *İŞLEM BAŞARISIZ*\n\nTür: ${isBuy ? "ALIM" : "SATIŞ"}\nToken: \`${tokenMint}\`\nHata: ${errMsg}`);
+    await sendTelegramMessage(`❌ *İŞLEM BAŞARISIZ*\n\nCüzdan: \`${walletLabel}\`\nTür: ${isBuy ? "ALIM" : "SATIŞ"}\nToken: \`${tokenMint}\`\nHata: ${errMsg}`);
   }
 }
 };
