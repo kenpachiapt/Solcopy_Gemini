@@ -39,9 +39,6 @@ apiRouter.use((req, res, next) => {
   next();
 });
 
-// Mount API Router early
-app.use("/api", apiRouter);
-
 // Initialize Database
 db.exec(`
   CREATE TABLE IF NOT EXISTS tracked_wallets (
@@ -1354,6 +1351,9 @@ apiRouter.all("*", (req, res) => {
   console.log(`>>> API 404: ${req.method} ${req.url}`);
   res.status(404).json({ error: "API Route Not Found", path: req.url });
 });
+
+// Mount API Router
+app.use("/api", apiRouter);
 
 // Vite Integration
 async function startServer() {
