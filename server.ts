@@ -20,28 +20,27 @@ const app = express();
 const PORT = 3000;
 const db = new Database("trading.db");
 
-// API Router Definition (Early)
-const apiRouter = express.Router();
-
-// Request Logger for API - Moved to top of router
-apiRouter.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] API ROUTER MATCH: ${req.method} ${req.url}`);
+// Global Request Logger
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] GLOBAL REQUEST: ${req.method} ${req.url}`);
   next();
 });
 
 // Global Middleware
 app.use(express.json());
-app.use((req, res, next) => {
-  if (req.url.startsWith('/api')) {
-    console.log(`[${new Date().toISOString()}] GLOBAL API REQUEST: ${req.method} ${req.url}`);
-    // Force JSON content type for all /api requests
-    res.setHeader('Content-Type', 'application/json');
-  }
+
+// API Router Definition
+const apiRouter = express.Router();
+
+// Request Logger for API
+apiRouter.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] API REQUEST: ${req.method} ${req.url}`);
+  res.setHeader('Content-Type', 'application/json');
   next();
 });
 
-// Mount API Router early to ensure it takes precedence
-// REMOVED FROM HERE - MOVED TO BOTTOM
+// Mount API Router early
+app.use("/api", apiRouter);
 
 // Initialize Database
 db.exec(`
@@ -1358,9 +1357,6 @@ apiRouter.all("*", (req, res) => {
 
 // Vite Integration
 async function startServer() {
-  // Mount API Router early to ensure it takes precedence over SPA fallback
-  app.use("/api", apiRouter);
-
   // Vite Integration
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
