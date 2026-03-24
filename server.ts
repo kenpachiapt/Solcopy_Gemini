@@ -1352,11 +1352,12 @@ apiRouter.all("*", (req, res) => {
   res.status(404).json({ error: "API Route Not Found", path: req.url });
 });
 
-// Mount API Router
-app.use("/api", apiRouter);
-
 // Vite Integration
 async function startServer() {
+  // Mount API Router FIRST to ensure it takes precedence over Vite
+  console.log(">>> Mounting API Router at /api");
+  app.use("/api", apiRouter);
+
   // Vite Integration
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -1367,6 +1368,10 @@ async function startServer() {
   } else {
     app.use(express.static("dist"));
     app.get("*", (req, res) => {
+      if (req.url.startsWith('/api')) {
+        console.log(`>>> API LEAK DETECTED: ${req.method} ${req.url}`);
+        return res.status(404).json({ error: "API Route Not Found (Leaked to Catch-all)", path: req.url });
+      }
       res.sendFile(path.resolve(__dirname, "dist", "index.html"));
     });
   }
