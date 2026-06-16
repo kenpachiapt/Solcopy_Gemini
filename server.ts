@@ -1017,8 +1017,15 @@ const checkStopLoss = async () => {
   
   for (const pos of positions) {
     try {
-      // Get current price (e.g., from Jupiter or Birdeye API)
+      // Get current price (tries Jupiter, DefiLlama, DexScreener with in-memory caching fallback)
       const currentPrice = await getTokenPrice(pos.token_mint);
+      
+      // CRITICAL SECURITY GUARD: If price is 0 or negative (API failure and no cache),
+      // do NOT trigger stop-loss. This prevents selling users' tokens on temporary API timeouts.
+      if (currentPrice <= 0) {
+        console.warn(`[StopLoss] Skipped check for ${pos.token_symbol} (${pos.token_mint}) due to unresolved zero price fetch.`);
+        continue;
+      }
       
       if (currentPrice > pos.highest_price) {
         db.prepare("UPDATE positions SET highest_price = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(currentPrice, pos.id);
@@ -1043,17 +1050,88 @@ const checkStopLoss = async () => {
   }
 };
 
+// Simple active in-memory price cache to prevent constant network hammering and allow graceful failovers
+const tokenPriceCache = new Map<string, number>();
+
 const getTokenPrice = async (mint: string): Promise<number> => {
   if (STABLECOINS.includes(mint)) return 1.0;
   
+  if (mint === SOL_MINT) {
+    try {
+      const solPrice = await getSolPrice();
+      if (solPrice > 0) {
+        tokenPriceCache.set(mint, solPrice);
+        return solPrice;
+      }
+    } catch (solErr) {
+      // fallback
+    }
+    return cachedSolPrice;
+  }
+  
+  // 1. Try Jupiter Public Price API v2
   try {
-    // Try Jupiter Price API
-    const response = await axios.get(`https://api.jup.ag/price/v2?ids=${mint}`, { timeout: 5000 });
+    const response = await axios.get(`https://api.jup.ag/price/v2?ids=${mint}`, { timeout: 4000 });
     const price = response.data?.data?.[mint]?.price;
-    if (price) return parseFloat(price);
-  } catch (err) {
-    // Fallback to cached SOL price if mint is SOL
-    if (mint === SOL_MINT) return cachedSolPrice;
+    if (price) {
+      const p = parseFloat(price);
+      if (p > 0) {
+        tokenPriceCache.set(mint, p);
+        return p;
+      }
+    }
+  } catch (err: any) {
+    // Log failures only if we have no cache, keeping the console cleaner
+    if (!tokenPriceCache.has(mint)) {
+      console.warn(`[PriceAPI] Jupiter failed for ${mint}: ${err.message}`);
+    }
+  }
+
+  // 2. Try DefiLlama Coins public API as first backup
+  try {
+    const response = await axios.get(`https://coins.llama.fi/prices/current/solana:${mint}`, { timeout: 4000 });
+    const price = response.data?.coins?.[`solana:${mint}`]?.price;
+    if (price) {
+      const p = parseFloat(price);
+      if (p > 0) {
+        tokenPriceCache.set(mint, p);
+        return p;
+      }
+    }
+  } catch (err: any) {
+    if (!tokenPriceCache.has(mint)) {
+      console.warn(`[PriceAPI] DefiLlama failed for ${mint}: ${err.message}`);
+    }
+  }
+
+  // 3. Try DexScreener pairs lookup as second backup
+  try {
+    const response = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, { timeout: 4000 });
+    const pairs = response.data?.pairs || [];
+    const solanaPairs = pairs.filter((p: any) => p.chainId === "solana");
+    if (solanaPairs.length > 0) {
+      // Sort by liquidity (USD) descending
+      solanaPairs.sort((a: any, b: any) => {
+        const liqA = a.liquidity?.usd || 0;
+        const liqB = b.liquidity?.usd || 0;
+        return liqB - liqA;
+      });
+      const price = parseFloat(solanaPairs[0].priceUsd);
+      if (price > 0) {
+        tokenPriceCache.set(mint, price);
+        return price;
+      }
+    }
+  } catch (err: any) {
+    if (!tokenPriceCache.has(mint)) {
+      console.warn(`[PriceAPI] DexScreener failed for ${mint}: ${err.message}`);
+    }
+  }
+
+  // 4. Fallback to our existing in-memory price cache for this token
+  const cachedVal = tokenPriceCache.get(mint);
+  if (cachedVal && cachedVal > 0) {
+    return cachedVal;
   }
   
   return 0; 
@@ -1217,24 +1295,29 @@ const getSolPrice = async (): Promise<number> => {
 
   const sources = [
     {
+      name: "Coinbase",
+      url: "https://api.coinbase.com/v2/prices/SOL-USD/spot",
+      parser: (data: any) => data?.data?.amount
+    },
+    {
+      name: "DefiLlama",
+      url: "https://coins.llama.fi/prices/current/solana:So11111111111111111111111111111111111111112",
+      parser: (data: any) => data?.coins?.["solana:So11111111111111111111111111111111111111112"]?.price
+    },
+    {
       name: "Binance",
       url: "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT",
       parser: (data: any) => data?.price
     },
     {
-      name: "Jupiter",
-      url: "https://price.jup.ag/v4/price?ids=SOL",
-      parser: (data: any) => data?.data?.SOL?.price
+      name: "Kraken",
+      url: "https://api.kraken.com/0/public/Ticker?pair=SOLUSD",
+      parser: (data: any) => data?.result?.SOLUSD?.c?.[0]
     },
     {
       name: "CoinGecko",
       url: "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
       parser: (data: any) => data?.solana?.usd
-    },
-    {
-      name: "Kraken",
-      url: "https://api.kraken.com/0/public/Ticker?pair=SOLUSD",
-      parser: (data: any) => data?.result?.SOLUSD?.c?.[0]
     }
   ];
 
@@ -1251,8 +1334,8 @@ const getSolPrice = async (): Promise<number> => {
       lastPriceFetch = now;
       console.log(`💰 SOL Price updated from ${source.name}: $${price}`);
       return price;
-    } catch (err) {
-      // Silent fail for individual sources
+    } catch (err: any) {
+      // Silent fail for individual sources, can output minimal diagnostic logs on true debug
     }
   }
 
