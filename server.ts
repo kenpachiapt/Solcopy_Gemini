@@ -1245,7 +1245,7 @@ const getSolPrice = async (): Promise<number> => {
         const p = source.parser(response.data);
         if (p) return parseFloat(p);
         throw new Error("Invalid format");
-      }, 0, 0); 
+      }, 1, 1000); 
       
       cachedSolPrice = price;
       lastPriceFetch = now;
