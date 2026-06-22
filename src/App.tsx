@@ -87,6 +87,7 @@ export default function App() {
   const [walletBalance, setWalletBalance] = useState({ balance: 0, address: "" });
   const [newWallet, setNewWallet] = useState({ address: "", label: "" });
   const [editingWallet, setEditingWallet] = useState<{ id: number, label: string } | null>(null);
+  const [addModalOpen, setAddModalOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [solPrice, setSolPrice] = useState(150);
   const [botEnabled, setBotEnabled] = useState(true);
@@ -194,20 +195,42 @@ export default function App() {
 
   const addWallet = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newWallet.address) return;
+    const addressClean = newWallet.address.trim();
+    const labelClean = newWallet.label.trim();
+
+    if (!addressClean) {
+      showNotification("Cüzdan adresi boş bırakılamaz!", "error");
+      return;
+    }
+
+    // Validate Solana address format via base58-like regex for 32-44 characters
+    if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(addressClean)) {
+      showNotification("Lütfen geçerli bir Solana cüzdan adresi girin!", "error");
+      return;
+    }
+
     setLoading(true);
     try {
       const res = await fetch("/api/wallets", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(newWallet)
+        body: JSON.stringify({
+          address: addressClean,
+          label: labelClean || undefined
+        })
       });
       if (res.ok) {
         setNewWallet({ address: "", label: "" });
+        setAddModalOpen(false);
         fetchData();
+        showNotification("Cüzdan başarıyla eklendi ve takibe alındı!");
+      } else {
+        const errorData = await res.json().catch(() => ({}));
+        showNotification(errorData.error || "Cüzdan eklenirken hata oluştu!", "error");
       }
     } catch (error) {
       console.error("Failed to add wallet:", error);
+      showNotification("Cüzdan eklenirken sistemsel hata oluştu!", "error");
     } finally {
       setLoading(false);
     }
@@ -634,7 +657,10 @@ export default function App() {
               >
                 <div className="flex items-center justify-between mb-8">
                   <h2 className="text-2xl font-bold">Takip Edilen Cüzdanlar</h2>
-                  <button className="solana-gradient text-black font-bold px-6 py-2 rounded-xl text-xs flex items-center gap-2">
+                  <button 
+                    onClick={() => setAddModalOpen(true)}
+                    className="solana-gradient text-black font-bold px-6 py-2 rounded-xl text-xs flex items-center gap-2 hover:opacity-90 transition-opacity"
+                  >
                     <Plus className="w-4 h-4" /> YENİ CÜZDAN EKLE
                   </button>
                 </div>
@@ -807,8 +833,10 @@ export default function App() {
                           {w.label?.[0] || "W"}
                         </div>
                         <div className="flex items-center gap-2">
-                          <div className="w-2 h-2 rounded-full bg-[#14F195] animate-pulse" />
-                          <span className="text-[10px] font-bold text-[#14F195]">AKTİF</span>
+                          <div className={`w-2 h-2 rounded-full ${w.is_active === 1 ? 'bg-[#14F195] animate-pulse' : 'bg-red-500'}`} />
+                          <span className={`text-[10px] font-bold ${w.is_active === 1 ? 'text-[#14F195]' : 'text-red-500'}`}>
+                            {w.is_active === 1 ? 'AKTİF' : 'PASİF'}
+                          </span>
                         </div>
                       </div>
                       <h3 className="font-bold mb-1">{w.label || "İsimsiz"}</h3>
@@ -816,10 +844,10 @@ export default function App() {
                       <div className="space-y-2">
                         <div className="flex justify-between text-[10px]">
                           <span className="text-gray-500">Kopyalama Oranı</span>
-                          <span className="text-gray-300">100%</span>
+                          <span className={`font-bold ${w.is_active === 1 ? 'text-[#14F195]' : 'text-gray-500'}`}>{w.is_active === 1 ? '100%' : '0%'}</span>
                         </div>
                         <div className="w-full h-1 bg-white/5 rounded-full overflow-hidden">
-                          <div className="w-full h-full bg-[#14F195]" />
+                          <div className={`h-full ${w.is_active === 1 ? 'w-full bg-[#14F195]' : 'w-0 bg-stone-600'}`} />
                         </div>
                       </div>
                     </div>
@@ -1118,6 +1146,84 @@ export default function App() {
               </div>
             </div>
           </div>
+          {/* Add Wallet Modal */}
+          <AnimatePresence>
+            {addModalOpen && (
+              <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+                <motion.div
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.95 }}
+                  className="glass-card p-6 rounded-2xl w-full max-w-md border border-white/10 relative shadow-2xl bg-[#0D0D0F]"
+                >
+                  <button 
+                    onClick={() => setAddModalOpen(false)}
+                    className="absolute top-4 right-4 p-1.5 hover:bg-white/5 rounded-lg text-gray-400 hover:text-white transition-colors"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+
+                  <div className="flex items-center gap-3 mb-6">
+                    <div className="p-2.5 rounded-xl bg-[#14F195]/10 text-[#14F195]">
+                      <Wallet className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h3 className="text-lg font-bold text-white">Yeni Cüzdan İzle</h3>
+                      <p className="text-xs text-gray-400">Solana cüzdan etkinliklerini gerçek zamanlı takip edin</p>
+                    </div>
+                  </div>
+
+                  <form onSubmit={addWallet} className="space-y-4">
+                    <div>
+                      <label className="block text-[10px] uppercase font-bold text-gray-500 mb-1.5">Cüzdan Adresi</label>
+                      <input 
+                        type="text" 
+                        placeholder="Örn: FHe7epuyyE79bYM..." 
+                        className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-xs font-mono focus:outline-none focus:border-[#14F195]/50 focus:ring-1 focus:ring-[#14F195]/30 transition-all text-white"
+                        value={newWallet.address}
+                        onChange={(e) => setNewWallet({ ...newWallet, address: e.target.value })}
+                        required
+                        autoFocus
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-[10px] uppercase font-bold text-gray-500 mb-1.5">Cüzdan İsmi / Etiket (Opsiyonel)</label>
+                      <input 
+                        type="text" 
+                        placeholder="Örn: Balina 1" 
+                        className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-xs focus:outline-none focus:border-[#14F195]/50 focus:ring-1 focus:ring-[#14F195]/30 transition-all text-white"
+                        value={newWallet.label}
+                        onChange={(e) => setNewWallet({ ...newWallet, label: e.target.value })}
+                      />
+                    </div>
+
+                    <div className="flex gap-3 pt-4">
+                      <button 
+                        type="button"
+                        onClick={() => setAddModalOpen(false)}
+                        className="flex-1 bg-white/5 hover:bg-white/10 text-gray-300 font-bold py-3 rounded-xl text-xs transition-colors"
+                      >
+                        İPTAL
+                      </button>
+                      <button 
+                        type="submit"
+                        disabled={loading}
+                        className="flex-1 solana-gradient text-black font-bold py-3 rounded-xl text-xs flex items-center justify-center gap-2 hover:opacity-90 disabled:opacity-50 transition-all"
+                      >
+                        {loading ? (
+                          <RefreshCw className="w-4 h-4 animate-spin" />
+                        ) : (
+                          <Plus className="w-4 h-4" />
+                        )}
+                        TAKİBİ BAŞLAT
+                      </button>
+                    </div>
+                  </form>
+                </motion.div>
+              </div>
+            )}
+          </AnimatePresence>
         </div>
       </main>
     </div>
