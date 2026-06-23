@@ -122,6 +122,14 @@ const getConnection = () => {
 let connection = getConnection();
 
 // Telegram Bot
+const escapeHtml = (text: string): string => {
+  if (!text) return "";
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+};
+
 const getTelegramConfig = () => {
   const settings = db.prepare("SELECT * FROM settings WHERE key IN ('telegram_token', 'telegram_chat_id')").all() as { key: string, value: string }[];
   const config = settings.reduce((acc: any, curr: any) => {
@@ -141,11 +149,11 @@ const sendTelegramMessage = async (message: string) => {
   try {
     const tempBot = new Telegraf(token);
     await tempBot.telegram.sendMessage(chatId, message, {
-      parse_mode: "Markdown",
+      parse_mode: "HTML",
       link_preview_options: { is_disabled: true },
     });
   } catch (error) {
-    console.error("Telegram error:", error);
+    console.error("Telegram error in sendTelegramMessage:", error);
   }
 };
 
@@ -606,6 +614,7 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     let finalSlippageUsed = slippageBps;
     const maxRetries = isBuy ? 1 : 5; // Retry up to 5 times for sells
     let attempt = 0;
+    let outAmountRaw = "0";
 
     while (attempt < maxRetries) {
       try {
@@ -629,6 +638,8 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
         if (!quoteResponse.data || !quoteResponse.data.outAmount) {
           throw new Error("Invalid quote response from Jupiter");
         }
+
+        outAmountRaw = quoteResponse.data.outAmount;
 
         const swapResponse = await axios.post(swapUrl, {
           quoteResponse: quoteResponse.data,
@@ -698,6 +709,19 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     const traderPreBal = finalTx?.meta?.preTokenBalances?.find(b => b.owner === traderPubkey.toBase58() && b.mint === tokenMint);
     const traderDeltaRaw = new BigNumber(traderPostBal?.uiTokenAmount?.amount || "0").minus(new BigNumber(traderPreBal?.uiTokenAmount?.amount || "0")).abs();
 
+    const existingPosition = getPosition(tokenMint);
+    const revenueSol = !isBuy && outAmountRaw !== "0" ? new BigNumber(outAmountRaw).dividedBy(LAMPORTS_PER_SOL).toNumber() : 0;
+    const soldUi = traderDeltaRaw.dividedBy(new BigNumber(10).pow(decimals)).toNumber();
+    const solAmount = isBuy ? (amountRawBN.toNumber() / LAMPORTS_PER_SOL) : revenueSol;
+
+    let pnlSol = 0;
+    let pnlPercent = 0;
+    if (!isBuy && existingPosition && existingPosition.entry_price) {
+      const costBasisSol = soldUi * existingPosition.entry_price;
+      pnlSol = revenueSol - costBasisSol;
+      pnlPercent = costBasisSol > 0 ? (pnlSol / costBasisSol) * 100 : 0;
+    }
+
     // Record trade
     db.prepare(`
       INSERT INTO trades (
@@ -707,8 +731,8 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
       walletAddress,
       tokenMint,
       isBuy ? "buy" : "sell",
-      isBuy ? amountRawBN.toNumber() / LAMPORTS_PER_SOL : null,
-      traderDeltaRaw.dividedBy(new BigNumber(10).pow(decimals)).toNumber(),
+      solAmount,
+      soldUi,
       txid,
       originalSignature,
       (finalTx?.meta?.fee || 0) / LAMPORTS_PER_SOL,
@@ -733,39 +757,59 @@ const executeCopyTrade = async (originalTx: any, walletAddress: string, currentC
     }
 
     if (isBuy) {
-      await sendTelegramMessage(`🟢 *ALIM EMRİ GERÇEKLEŞTİ*\n\nCüzdan: \`${walletLabel}\`\nToken: \`${tokenMint}\`\nMiktar: ${amountRawBN.toNumber() / LAMPORTS_PER_SOL} SOL\nTX: [Solscan](https://solscan.io/tx/${txid})`);
+      const tokenSymBuy = (existingPosition?.token_symbol || "TOKEN");
+      await sendTelegramMessage(`🟢 <b>ALIM EMRİ GERÇEKLEŞTİ</b>\n\n` +
+        `👤 Cüzdan: <code>${escapeHtml(walletLabel)}</code>\n` +
+        `🪙 Token: <code>${escapeHtml(tokenSymBuy)}</code> (<code>${escapeHtml(tokenMint.slice(0,4))}...${escapeHtml(tokenMint.slice(-4))}</code>)\n` +
+        `📦 Alınan Miktar: <b>${soldUi.toLocaleString(undefined, { maximumFractionDigits: 6 })} ${escapeHtml(tokenSymBuy)}</b>\n` +
+        `💰 Harcanan SOL: <b>${solAmount.toFixed(4)} SOL</b>\n` +
+        `🔗 TX: <a href="https://solscan.io/tx/${txid}">Solscan</a>`);
     } else {
-      await sendTelegramMessage(`🔴 *SATIŞ EMRİ GERÇEKLEŞTİ*\n\nCüzdan: \`${walletLabel}\`\nToken: \`${tokenMint}\`\nMiktar: ${amountRawBN.toFixed(0)} birim\nTX: [Solscan](https://solscan.io/tx/${txid})`);
+      const tokenSymbol = existingPosition?.token_symbol || "TOKEN";
+      const pnlSign = pnlSol >= 0 ? "+" : "";
+      const pnlEmoji = pnlSol >= 0 ? "🟢" : "🔴";
+      
+      await sendTelegramMessage(`🔴 <b>SATIŞ EMRİ GERÇEKLEŞTİ</b>\n\n` +
+        `👤 Cüzdan: <code>${escapeHtml(walletLabel)}</code>\n` +
+        `🪙 Token: <code>${escapeHtml(tokenSymbol)}</code> (<code>${escapeHtml(tokenMint.slice(0,4))}...${escapeHtml(tokenMint.slice(-4))}</code>)\n` +
+        `📦 Satılan Miktar: <b>${soldUi.toLocaleString(undefined, { maximumFractionDigits: 6 })} ${escapeHtml(tokenSymbol)}</b>\n` +
+        `💰 Alınan SOL: <b>${revenueSol.toFixed(4)} SOL</b>\n` +
+        `📊 Kar/Zarar: ${pnlEmoji} <b>${pnlSign}${pnlSol.toFixed(4)} SOL</b> (${pnlSign}${pnlPercent.toFixed(2)}%)\n` +
+        `🔗 TX: <a href="https://solscan.io/tx/${txid}">Solscan</a>`);
     }
   } catch (error) {
-  console.error("Copy trade failed:", error);
-  const errMsg = getErrorMessage(error);
-  
-  // Record failed trade
-  try {
-    db.prepare(`
-      INSERT INTO trades (
-        wallet_address, token_mint, side, status, error_message, original_tx_hash
-      ) VALUES (?, ?, ?, 'failed', ?, ?)
-    `).run(
-      walletAddress,
-      tokenMint,
-      isBuy ? 'buy' : 'sell',
-      errMsg,
-      originalSignature
-    );
-  } catch (dbErr) {
-    console.error("Failed to record failed trade in DB:", dbErr);
-  }
+    console.error("Copy trade failed:", error);
+    const errMsg = getErrorMessage(error);
+    
+    // Record failed trade
+    try {
+      db.prepare(`
+        INSERT INTO trades (
+          wallet_address, token_mint, side, status, error_message, original_tx_hash
+        ) VALUES (?, ?, ?, 'failed', ?, ?)
+      `).run(
+        walletAddress,
+        tokenMint,
+        isBuy ? 'buy' : 'sell',
+        errMsg,
+        originalSignature
+      );
+    } catch (dbErr) {
+      console.error("Failed to record failed trade in DB:", dbErr);
+    }
 
-  // Only notify on critical failures, not for "insufficient balance" or "no balance to sell"
-  const silentErrors = ["Yetersiz bakiye", "Insufficient balance", "no balance for", "Insufficient funds", "insufficient funds"];
-  const shouldNotify = !silentErrors.some(err => errMsg.includes(err));
+    // Only notify on critical failures, not for "insufficient balance" or "no balance to sell"
+    const silentErrors = ["Yetersiz bakiye", "Insufficient balance", "no balance for", "Insufficient funds", "insufficient funds"];
+    const shouldNotify = !silentErrors.some(err => errMsg.includes(err));
 
-  if (shouldNotify) {
-    await sendTelegramMessage(`❌ *İŞLEM BAŞARISIZ*\n\nCüzdan: \`${walletLabel}\`\nTür: ${isBuy ? "ALIM" : "SATIŞ"}\nToken: \`${tokenMint}\`\nHata: ${errMsg}`);
+    if (shouldNotify) {
+      await sendTelegramMessage(`❌ <b>İŞLEM BAŞARISIZ</b>\n\n` +
+        `👤 Cüzdan: <code>${escapeHtml(walletLabel)}</code>\n` +
+        `Tür: <b>${isBuy ? "ALIM" : "SATIŞ"}</b>\n` +
+        `🪙 Token: <code>${escapeHtml(tokenMint)}</code>\n` +
+        `⚠️ Hata: <code>${escapeHtml(errMsg)}</code>`);
+    }
   }
-}
 };
 
 const processTransaction = async (signature: string, walletAddress: string) => {
@@ -911,6 +955,7 @@ const executeSell = async (tokenMint: string, amountRaw: string, decimals: numbe
   let txid = "";
   const maxRetries = 5;
   let attempt = 0;
+  let outAmountRaw = "0";
 
   while (attempt < maxRetries) {
     try {
@@ -931,6 +976,8 @@ const executeSell = async (tokenMint: string, amountRaw: string, decimals: numbe
       if (!quoteResponse.data || !quoteResponse.data.outAmount) {
         throw new Error("Invalid quote response from Jupiter");
       }
+
+      outAmountRaw = quoteResponse.data.outAmount;
 
       const swapResponse = await axios.post(swapUrl, {
         quoteResponse: quoteResponse.data,
@@ -988,16 +1035,42 @@ const executeSell = async (tokenMint: string, amountRaw: string, decimals: numbe
     }
   }
 
+  // Fetch final tx to get actual delta / fee
+  let finalTx: any = null;
+  try {
+    finalTx = await currentConnection.getTransaction(txid, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0
+    });
+  } catch (txErr) {
+    console.warn("⚠️ Failed to fetch final TX for stop-loss:", txErr);
+  }
+
+  const existingPosition = getPosition(tokenMint);
+  const tokenSymbol = existingPosition?.token_symbol || "TOKEN";
+  const soldUi = new BigNumber(amountRaw).dividedBy(new BigNumber(10).pow(decimals)).toNumber();
+  const revenueSol = outAmountRaw !== "0" ? new BigNumber(outAmountRaw).dividedBy(LAMPORTS_PER_SOL).toNumber() : 0;
+
+  let pnlSol = 0;
+  let pnlPercent = 0;
+  if (existingPosition && existingPosition.entry_price) {
+    const costBasisSol = soldUi * existingPosition.entry_price;
+    pnlSol = revenueSol - costBasisSol;
+    pnlPercent = costBasisSol > 0 ? (pnlSol / costBasisSol) * 100 : 0;
+  }
+
   // Record trade and update position
   db.prepare(`
     INSERT INTO trades (
-      wallet_address, token_mint, side, status, tx_hash, fee, slippage
-    ) VALUES (?, ?, 'sell', 'completed', ?, ?, ?)
+      wallet_address, token_mint, side, amount_sol, amount_token, status, tx_hash, fee, slippage
+    ) VALUES (?, ?, 'sell', ?, ?, 'completed', ?, ?, ?)
   `).run(
     'SYSTEM_STOP_LOSS',
     tokenMint,
+    revenueSol,
+    soldUi,
     txid,
-    0.000005, // Placeholder fee
+    (finalTx?.meta?.fee || 0) / LAMPORTS_PER_SOL || 0.000005,
     slippageBps / 100
   );
 
@@ -1007,7 +1080,17 @@ const executeSell = async (tokenMint: string, amountRaw: string, decimals: numbe
     txid
   });
 
-  await sendTelegramMessage(`🔴 *STOP LOSS SATIŞI GERÇEKLEŞTİ*\n\nToken: \`${tokenMint}\`\nTX: [Solscan](https://solscan.io/tx/${txid})`);
+  const pnlSign = pnlSol >= 0 ? "+" : "";
+  const pnlEmoji = pnlSol >= 0 ? "🟢" : "🔴";
+
+  const stopLossMsg = `🔴 <b>STOP LOSS SATIŞI GERÇEKLEŞTİ</b>\n\n` +
+    `🪙 Token: <code>${escapeHtml(tokenSymbol)}</code> (<code>${escapeHtml(tokenMint.slice(0,4))}...${escapeHtml(tokenMint.slice(-4))}</code>)\n` +
+    `📦 Satılan Miktar: <b>${soldUi.toLocaleString(undefined, { maximumFractionDigits: 6 })} ${escapeHtml(tokenSymbol)}</b>\n` +
+    `💰 Alınan SOL: <b>${revenueSol.toFixed(4)} SOL</b>\n` +
+    `📊 Kar/Zarar: ${pnlEmoji} <b>${pnlSign}${pnlSol.toFixed(4)} SOL</b> (${pnlSign}${pnlPercent.toFixed(2)}%)\n` +
+    `🔗 TX: <a href="https://solscan.io/tx/${txid}">Solscan</a>`;
+
+  await sendTelegramMessage(stopLossMsg);
   return txid;
 };
 
@@ -1033,7 +1116,7 @@ const checkStopLoss = async () => {
         const dropPercent = ((pos.highest_price - currentPrice) / pos.highest_price) * 100;
         if (dropPercent >= pos.stop_loss_percent) {
           console.log(`Stop loss triggered for ${pos.token_symbol} at ${currentPrice}`);
-          await sendTelegramMessage(`⚠️ *Stop Loss Triggered!*\nToken: ${pos.token_symbol}\nPrice: ${currentPrice}\nDrop: ${dropPercent.toFixed(2)}%`);
+          await sendTelegramMessage(`⚠️ <b>Stop-Loss Tetiklendi!</b>\n🪙 Token: <code>${escapeHtml(pos.token_symbol || 'TOKEN')}</code>\n💵 Fiyat: <b>${currentPrice}</b>\n📉 Düşüş: <b>%${dropPercent.toFixed(2)}</b>`);
           
           // Execute sell logic
           try {
@@ -1384,6 +1467,27 @@ apiRouter.post("/settings/toggle-bot", (req, res) => {
   } catch (error) {
     console.error(">>> Error in POST /api/settings/toggle-bot:", error);
     res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+apiRouter.post("/settings/test-telegram", async (req, res) => {
+  console.log(">>> Handling POST /api/settings/test-telegram");
+  try {
+    const { token, chatId } = getTelegramConfig();
+    if (!token || !chatId) {
+      return res.status(400).json({ error: "Telegram Bot Token ve Chat ID eksik! Ayarlar sekmesinden bu değerleri doldurun ve kaydedin." });
+    }
+    
+    const tempBot = new Telegraf(token);
+    await tempBot.telegram.sendMessage(chatId, `🔔 <b>SOLANA COPY TRADER PRO - BİLDİRİM TESTİ</b>\n\nTelegram bildirimleri başarıyla aktif edilmiştir! Kopyalanan alım/satım işlemleri ve stop-loss tetiklenmeleri buraya gönderilecektir.`, {
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+    });
+    
+    res.json({ success: true, message: "Test bildirimi başarıyla gönderildi!" });
+  } catch (error) {
+    console.error(">>> Test Telegram error:", error);
+    res.status(500).json({ error: `Bildirim gönderilemedi: ${error instanceof Error ? error.message : String(error)}` });
   }
 });
 

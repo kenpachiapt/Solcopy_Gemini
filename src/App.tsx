@@ -123,14 +123,10 @@ export default function App() {
         }},
         { name: "settings", url: "/api/settings", setter: (data: any) => {
           if (Object.keys(data).length > 0) {
-            setSettings(prev => {
-              const newSettings = { ...prev, ...data };
-              // Use ref to avoid stale closure
-              if (activeTabRef.current !== "settings") {
-                setLocalSettings(newSettings);
-              }
-              return newSettings;
-            });
+            setSettings(prev => ({ ...prev, ...data }));
+            if (activeTabRef.current !== "settings") {
+              setLocalSettings(prev => ({ ...prev, ...data }));
+            }
             if (data.bot_enabled !== undefined) setBotEnabled(data.bot_enabled === "true");
           }
         }},
@@ -177,6 +173,36 @@ export default function App() {
       showNotification("Ayarlar kaydedilirken hata oluştu!", "error");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const [testingTelegram, setTestingTelegram] = useState(false);
+  const testTelegram = async () => {
+    setTestingTelegram(true);
+    try {
+      // First save to make sure DB is updated
+      const saveRes = await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(localSettings)
+      });
+      if (!saveRes.ok) throw new Error("Ayarları kaydetme başarısız oldu.");
+
+      // Run telegram test
+      const res = await fetch("/api/settings/test-telegram", {
+        method: "POST",
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        showNotification("Test bildirimi başarıyla gönderildi! Lütfen kanalı/grubu kontrol edin.", "success");
+      } else {
+        showNotification(data.error || "Telegram bildirim testi başarısız.", "error");
+      }
+    } catch (error: any) {
+      console.error("Failed to test Telegram:", error);
+      showNotification(`Test başarısız: ${error.message || error}`, "error");
+    } finally {
+      setTestingTelegram(false);
     }
   };
 
@@ -1096,13 +1122,22 @@ export default function App() {
                         </div>
                       </div>
                     </div>
-                    <button 
-                      onClick={saveSettings}
-                      disabled={loading}
-                      className="w-full solana-gradient text-black font-bold py-3 rounded-xl text-sm hover:opacity-90 transition-opacity disabled:opacity-50"
-                    >
-                      {loading ? "KAYDEDİLİYOR..." : "AYARLARI KAYDET"}
-                    </button>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <button 
+                        onClick={saveSettings}
+                        disabled={loading}
+                        className="w-full solana-gradient text-black font-bold py-3 rounded-xl text-sm hover:opacity-90 transition-opacity disabled:opacity-50"
+                      >
+                        {loading ? "KAYDEDİLİYOR..." : "AYARLARI KAYDET"}
+                      </button>
+                      <button 
+                        onClick={testTelegram}
+                        disabled={testingTelegram || loading}
+                        className="w-full bg-white/5 border border-white/10 text-white font-bold py-3 rounded-xl text-sm hover:bg-white/10 transition-colors disabled:opacity-50"
+                      >
+                        {testingTelegram ? "GÖNDERİLİYOR..." : "TELEGRAM TEST ET"}
+                      </button>
+                    </div>
                   </div>
                 </div>
               </motion.div>
