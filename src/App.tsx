@@ -551,8 +551,8 @@ export default function App() {
                         ))}
                       </div>
                     </div>
-                    <div className="flex-1 w-full">
-                      <ResponsiveContainer width="100%" height="100%">
+                    <div className="flex-1 w-full min-h-[350px]">
+                      <ResponsiveContainer width="100%" height={350}>
                         <AreaChart data={trades.length > 0 ? trades.slice().reverse().map((t, i) => ({
                           time: formatDateSafe(t.created_at, 'shortTime'),
                           price: t.amount_sol || 0,

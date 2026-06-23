@@ -1,6 +1,31 @@
 <!doctype html>
 <html lang="en">
   <head>
+    <script>
+      // Early catch-all to suppress ResizeObserver and cross-origin "Script error."
+      window.onerror = function (message, url, line, col, error) {
+        var msg = String(message || "");
+        if (msg.includes('ResizeObserver') || msg.includes('Script error') || msg === 'Script error.') {
+          console.warn("Suppressed cross-origin or ResizeObserver error:", msg);
+          return true; // prevent default browser handling
+        }
+        return false;
+      };
+      window.addEventListener('error', function (e) {
+        var msg = String(e.message || "");
+        if (msg.includes('ResizeObserver') || msg.includes('Script error') || msg === 'Script error.') {
+          e.stopImmediatePropagation();
+          e.preventDefault();
+        }
+      }, true);
+      window.addEventListener('unhandledrejection', function (e) {
+        var reasonStr = String(e.reason || "");
+        if (reasonStr.includes('ResizeObserver') || reasonStr.includes('Script error')) {
+          e.stopImmediatePropagation();
+          e.preventDefault();
+        }
+      }, true);
+    </script>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>My Google AI Studio App</title>
