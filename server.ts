@@ -67,21 +67,7 @@ db.exec(`
     error_message TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
-`);
 
-// Migration: Add original_tx_hash if it doesn't exist
-try {
-  const columns = db.prepare("PRAGMA table_info(trades)").all() as any[];
-  const hasOriginalTxHash = columns.some(c => c.name === 'original_tx_hash');
-  if (!hasOriginalTxHash) {
-    db.prepare("ALTER TABLE trades ADD COLUMN original_tx_hash TEXT").run();
-    console.log("✅ Migration: Added original_tx_hash column to trades table");
-  }
-} catch (e) {
-  console.error("Migration error:", e);
-}
-
-db.exec(`
   CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -111,6 +97,47 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_trades_wallet ON trades(wallet_address);
   CREATE INDEX IF NOT EXISTS idx_trades_token ON trades(token_mint);
 `);
+
+// Migration: Add original_tx_hash if it doesn't exist
+try {
+  const columns = db.prepare("PRAGMA table_info(trades)").all() as any[];
+  const hasOriginalTxHash = columns.some(c => c.name === 'original_tx_hash');
+  if (!hasOriginalTxHash) {
+    db.prepare("ALTER TABLE trades ADD COLUMN original_tx_hash TEXT").run();
+    console.log("✅ Migration: Added original_tx_hash column to trades table");
+  }
+  
+  const hasAmountSol = columns.some(c => c.name === 'amount_sol');
+  if (!hasAmountSol) {
+    db.prepare("ALTER TABLE trades ADD COLUMN amount_sol REAL").run();
+    console.log("✅ Migration: Added amount_sol column to trades table");
+  }
+
+  const hasAmountToken = columns.some(c => c.name === 'amount_token');
+  if (!hasAmountToken) {
+    db.prepare("ALTER TABLE trades ADD COLUMN amount_token REAL").run();
+    console.log("✅ Migration: Added amount_token column to trades table");
+  }
+} catch (e) {
+  console.error("Trades migration error:", e);
+}
+
+// Migration: Add columns to positions if they don't exist
+try {
+  const posColumns = db.prepare("PRAGMA table_info(positions)").all() as any[];
+  const hasAmountRaw = posColumns.some(c => c.name === 'amount_raw');
+  if (!hasAmountRaw) {
+    db.prepare("ALTER TABLE positions ADD COLUMN amount_raw TEXT DEFAULT '0'").run();
+    console.log("✅ Migration: Added amount_raw column to positions table");
+  }
+  const hasDecimals = posColumns.some(c => c.name === 'decimals');
+  if (!hasDecimals) {
+    db.prepare("ALTER TABLE positions ADD COLUMN decimals INTEGER DEFAULT 0").run();
+    console.log("✅ Migration: Added decimals column to positions table");
+  }
+} catch (e) {
+  console.error("Positions migration error:", e);
+}
 
 // Solana Connection Helper
 const getConnection = () => {
@@ -1553,13 +1580,14 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static("dist"));
+    const distPath = path.resolve(process.cwd(), "dist");
+    app.use(express.static(distPath));
     app.get("*", (req, res) => {
       if (req.url.startsWith('/api')) {
         console.log(`>>> API LEAK DETECTED: ${req.method} ${req.url}`);
         return res.status(404).json({ error: "API Route Not Found (Leaked to Catch-all)", path: req.url });
       }
-      res.sendFile(path.resolve(__dirname, "dist", "index.html"));
+      res.sendFile(path.resolve(distPath, "index.html"));
     });
   }
 

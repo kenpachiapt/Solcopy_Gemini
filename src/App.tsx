@@ -105,6 +105,30 @@ export default function App() {
   });
   const [localSettings, setLocalSettings] = useState(settings);
 
+  // Cross-browser safe date formatting helper
+  const formatDateSafe = (dateStr: string | undefined | null, formatType: 'time' | 'dateTime' | 'shortTime' = 'dateTime') => {
+    if (!dateStr) return "---";
+    let normalized = String(dateStr).trim();
+    if (normalized.includes(" ") && !normalized.includes("T")) {
+      normalized = normalized.replace(" ", "T");
+    }
+    const d = new Date(normalized);
+    if (isNaN(d.getTime())) {
+      return dateStr;
+    }
+    try {
+      if (formatType === 'shortTime') {
+        return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      } else if (formatType === 'time') {
+        return d.toLocaleTimeString();
+      } else {
+        return d.toLocaleString();
+      }
+    } catch (e) {
+      return dateStr;
+    }
+  };
+
   const [notification, setNotification] = useState<{ message: string, type: 'success' | 'error' } | null>(null);
 
   const showNotification = (message: string, type: 'success' | 'error' = 'success') => {
@@ -115,22 +139,46 @@ export default function App() {
   const fetchData = async () => {
     try {
       const endpoints = [
-        { name: "wallets", url: "/api/wallets", setter: setWallets },
-        { name: "trades", url: "/api/trades", setter: setTrades },
+        { name: "wallets", url: "/api/wallets", setter: (data: any) => {
+          if (Array.isArray(data)) {
+            setWallets(data);
+          } else {
+            console.warn("Expected array for wallets but received:", data);
+          }
+        }},
+        { name: "trades", url: "/api/trades", setter: (data: any) => {
+          if (Array.isArray(data)) {
+            setTrades(data);
+          } else {
+            console.warn("Expected array for trades but received:", data);
+          }
+        }},
         { name: "stats", url: "/api/stats", setter: (data: any) => {
-          setStats(data);
-          if (data.solPrice) setSolPrice(data.solPrice);
+          if (data && typeof data === 'object' && !data.error) {
+            setStats(prev => ({ ...prev, ...data }));
+            if (data.solPrice) setSolPrice(data.solPrice);
+          } else {
+            console.warn("Expected valid stats object but received:", data);
+          }
         }},
         { name: "settings", url: "/api/settings", setter: (data: any) => {
-          if (Object.keys(data).length > 0) {
+          if (data && typeof data === 'object' && !data.error && Object.keys(data).length > 0) {
             setSettings(prev => ({ ...prev, ...data }));
             if (activeTabRef.current !== "settings") {
               setLocalSettings(prev => ({ ...prev, ...data }));
             }
             if (data.bot_enabled !== undefined) setBotEnabled(data.bot_enabled === "true");
+          } else {
+            console.warn("Expected valid settings object but received:", data);
           }
         }},
-        { name: "balance", url: "/api/balance", setter: setWalletBalance }
+        { name: "balance", url: "/api/balance", setter: (data: any) => {
+          if (data && typeof data === 'object' && !data.error) {
+            setWalletBalance(data);
+          } else {
+            console.warn("Expected valid balance object but received:", data);
+          }
+        }}
       ];
 
       await Promise.all(endpoints.map(async (ep) => {
@@ -410,7 +458,7 @@ export default function App() {
             <div className="hidden sm:flex items-center gap-2">
               <Globe className="w-4 h-4 text-gray-500" />
               <span className="text-xs font-mono text-gray-400">SOL/USD:</span>
-              <span className="text-xs font-mono font-bold text-[#14F195]">${solPrice.toFixed(2)}</span>
+              <span className="text-xs font-mono font-bold text-[#14F195]">${(Number(solPrice) || 0).toFixed(2)}</span>
             </div>
             <div className="hidden sm:block h-4 w-px bg-white/10" />
             <div className="hidden md:flex items-center gap-2">
@@ -423,11 +471,11 @@ export default function App() {
           <div className="flex items-center gap-2 lg:gap-4">
             <div className="hidden sm:flex flex-col items-end">
               <span className="text-[10px] text-gray-500 uppercase font-bold tracking-tighter">İşlem Cüzdanı</span>
-              <span className="text-[10px] font-mono text-[#14F195]">{walletBalance.address ? `${walletBalance.address.slice(0, 4)}...${walletBalance.address.slice(-4)}` : "Ayarlanmadı"}</span>
+              <span className="text-[10px] font-mono text-[#14F195]">{walletBalance?.address ? `${walletBalance.address.slice(0, 4)}...${walletBalance.address.slice(-4)}` : "Ayarlanmadı"}</span>
             </div>
             <div className="flex items-center gap-2 lg:gap-3 px-3 lg:px-4 py-1.5 bg-white/5 rounded-full border border-white/10">
               <div className="w-2 h-2 rounded-full bg-[#9945FF]" />
-              <span className="text-[10px] lg:text-xs font-mono text-gray-300">{walletBalance.balance.toFixed(2)} SOL</span>
+              <span className="text-[10px] lg:text-xs font-mono text-gray-300">{(Number(walletBalance?.balance) || 0).toFixed(2)} SOL</span>
             </div>
             <button 
               onClick={toggleBot}
@@ -463,10 +511,10 @@ export default function App() {
                 {/* Hero Stats */}
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-4 lg:gap-6">
                   {[
-                    { label: "Toplam Hacim", value: `${stats.totalVolumeSol.toFixed(2)} SOL`, change: `$${(stats.totalVolumeSol * solPrice).toLocaleString()}`, icon: TrendingUp, color: "text-[#14F195]" },
-                    { label: "Kopya İşlemler", value: stats.totalTrades, change: "+5", icon: Activity, color: "text-[#9945FF]" },
+                    { label: "Toplam Hacim", value: `${(Number(stats?.totalVolumeSol) || 0).toFixed(2)} SOL`, change: `$${((Number(stats?.totalVolumeSol) || 0) * (Number(solPrice) || 150)).toLocaleString()}`, icon: TrendingUp, color: "text-[#14F195]" },
+                    { label: "Kopya İşlemler", value: stats?.totalTrades || 0, change: "+5", icon: Activity, color: "text-[#9945FF]" },
                     { label: "Takip Edilenler", value: wallets.length, change: "Canlı", icon: Cpu, color: "text-blue-400" },
-                    { label: "Net Kar", value: `${stats.netProfitSol >= 0 ? '+' : ''}${stats.netProfitSol.toFixed(2)} SOL`, change: `$${(stats.netProfitSol * solPrice).toLocaleString()}`, icon: BarChart3, color: stats.netProfitSol >= 0 ? "text-[#14F195]" : "text-red-400" },
+                    { label: "Net Kar", value: `${(Number(stats?.netProfitSol) || 0) >= 0 ? '+' : ''}${(Number(stats?.netProfitSol) || 0).toFixed(2)} SOL`, change: `$${((Number(stats?.netProfitSol) || 0) * (Number(solPrice) || 150)).toLocaleString()}`, icon: BarChart3, color: (Number(stats?.netProfitSol) || 0) >= 0 ? "text-[#14F195]" : "text-red-400" },
                   ].map((stat, i) => (
                     <div key={i} className="glass-card p-4 lg:p-6 rounded-2xl stat-card-gradient">
                       <div className="flex items-center justify-between mb-4">
@@ -506,7 +554,7 @@ export default function App() {
                     <div className="flex-1 w-full">
                       <ResponsiveContainer width="100%" height="100%">
                         <AreaChart data={trades.length > 0 ? trades.slice().reverse().map((t, i) => ({
-                          time: new Date(t.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                          time: formatDateSafe(t.created_at, 'shortTime'),
                           price: t.amount_sol || 0,
                           side: t.side
                         })) : chartData}>
@@ -593,7 +641,7 @@ export default function App() {
                               </div>
                               <div>
                                 <p className="text-[10px] font-bold text-gray-300">{w.label || "İsimsiz"}</p>
-                                <p className="text-[8px] font-mono text-gray-600">{w.address.slice(0, 4)}...{w.address.slice(-4)}</p>
+                                <p className="text-[8px] font-mono text-gray-600">{w.address ? `${w.address.slice(0, 4)}...${w.address.slice(-4)}` : ""}</p>
                               </div>
                             </div>
                             <button onClick={() => deleteWallet(w.id)} className="p-1.5 text-gray-600 hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100">
@@ -632,7 +680,7 @@ export default function App() {
                           <tr key={trade.id} className="hover:bg-white/2 transition-colors">
                             <td className="px-6 py-4">
                               <span className="text-[10px] text-gray-400 font-mono">
-                                {new Date(trade.created_at).toLocaleTimeString()}
+                                {formatDateSafe(trade.created_at, 'time')}
                               </span>
                             </td>
                             <td className="px-6 py-4">
@@ -802,11 +850,11 @@ export default function App() {
                           <tr key={trade.id} className="hover:bg-white/2 transition-colors">
                             <td className="px-6 py-4">
                               <span className="text-[10px] text-gray-400 font-mono">
-                                {new Date(trade.created_at).toLocaleString()}
+                                {formatDateSafe(trade.created_at, 'dateTime')}
                               </span>
                             </td>
                             <td className="px-6 py-4">
-                              <span className="text-[10px] text-gray-400 font-mono">{trade.wallet_address.slice(0, 4)}...{trade.wallet_address.slice(-4)}</span>
+                              <span className="text-[10px] text-gray-400 font-mono">{trade.wallet_address ? `${trade.wallet_address.slice(0, 4)}...${trade.wallet_address.slice(-4)}` : ""}</span>
                             </td>
                             <td className="px-6 py-4">
                               <span className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded ${
@@ -817,7 +865,7 @@ export default function App() {
                             </td>
                             <td className="px-6 py-4">
                               <div className="flex items-center gap-2">
-                                <span className="text-xs font-bold font-mono">{trade.token_mint.slice(0, 4)}...{trade.token_mint.slice(-4)}</span>
+                                <span className="text-xs font-bold font-mono">{trade.token_mint ? `${trade.token_mint.slice(0, 4)}...${trade.token_mint.slice(-4)}` : ""}</span>
                               </div>
                             </td>
                             <td className="px-6 py-4">
@@ -947,6 +995,7 @@ export default function App() {
                     </h3>
                     <div className="space-y-4">
                       {trades.length > 0 ? Object.entries(trades.reduce((acc: any, t) => {
+                        if (!t) return acc;
                         const key = t.token_symbol || (t.token_mint ? t.token_mint.slice(0, 8) : "Unknown");
                         acc[key] = (acc[key] || 0) + 1;
                         return acc;
@@ -954,7 +1003,7 @@ export default function App() {
                         <div key={i} className="flex items-center justify-between p-4 bg-white/5 rounded-xl border border-white/5">
                           <div className="flex items-center gap-3">
                             <div className="w-8 h-8 rounded-lg bg-white/10 flex items-center justify-center font-bold text-xs">
-                              {symbol[0]}
+                              {symbol && symbol[0] ? symbol[0] : "T"}
                             </div>
                             <span className="text-sm font-bold">{symbol}</span>
                           </div>
@@ -1161,7 +1210,7 @@ export default function App() {
                         <p className={`text-[10px] font-bold ${t.side === 'buy' ? 'text-[#14F195]' : 'text-red-400'}`}>
                           {t.side === 'buy' ? 'ALIŞ İŞLEMİ' : 'SATIŞ İŞLEMİ'}
                         </p>
-                        <span className="text-[8px] text-gray-600 font-mono">{new Date(t.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                        <span className="text-[8px] text-gray-600 font-mono">{formatDateSafe(t.created_at, 'shortTime')}</span>
                       </div>
                       <p className="text-xs font-bold text-gray-300 truncate">{t.token_symbol || (t.token_mint ? t.token_mint.slice(0, 8) : "Unknown")}</p>
                       <p className="text-[10px] text-gray-500 font-mono mt-0.5">{Number(t.amount_sol).toFixed(3)} SOL</p>
