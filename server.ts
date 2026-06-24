@@ -140,10 +140,75 @@ try {
 }
 
 // Solana Connection Helper
-const getConnection = () => {
+let activeRpcIndex = 0;
+
+const getRpcUrls = (): string[] => {
   const rpcSetting = db.prepare("SELECT value FROM settings WHERE key = 'solana_rpc'").get() as { value: string } | undefined;
-  const rpcUrl = rpcSetting?.value || process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
-  return new Connection(rpcUrl, "confirmed");
+  const userRpc = rpcSetting?.value || process.env.SOLANA_RPC;
+  
+  const urls: string[] = [];
+  if (userRpc && userRpc.trim() !== "") {
+    urls.push(userRpc);
+  }
+  
+  // Public fallbacks (Ankr, Solana Public-RPC, Mainnet-Beta, etc.)
+  const fallbacks = [
+    "https://rpc.ankr.com/solana",
+    "https://solana.public-rpc.com",
+    "https://api.mainnet-beta.solana.com",
+    "https://api.mainnet.solana.com",
+  ];
+  
+  for (const fb of fallbacks) {
+    if (!urls.includes(fb)) {
+      urls.push(fb);
+    }
+  }
+  
+  return urls;
+};
+
+const getConnection = (): Connection => {
+  const urls = getRpcUrls();
+  const baseConnection = new Connection(urls[0] || "https://api.mainnet-beta.solana.com", "confirmed");
+  
+  return new Proxy(baseConnection, {
+    get(target, prop, receiver) {
+      const activeUrl = urls[activeRpcIndex % urls.length];
+      const actualConnection = new Connection(activeUrl, "confirmed");
+      
+      const value = Reflect.get(actualConnection, prop);
+      if (typeof value === 'function') {
+        const isSubscriptionMethod = typeof prop === 'string' && (prop.startsWith('on') || prop.includes('Listener'));
+        if (isSubscriptionMethod) {
+          return value.bind(actualConnection);
+        }
+        
+        return async function(...args: any[]) {
+          let lastError: any;
+          for (let attempt = 0; attempt < Math.min(4, urls.length); attempt++) {
+            const currentIdx = (activeRpcIndex + attempt) % urls.length;
+            const currentUrl = urls[currentIdx];
+            const conn = new Connection(currentUrl, "confirmed");
+            try {
+              const method = Reflect.get(conn, prop);
+              const result = await method.apply(conn, args);
+              if (attempt > 0) {
+                activeRpcIndex = currentIdx;
+                console.log(`🔄 Rotated active Solana RPC to: ${currentUrl}`);
+              }
+              return result;
+            } catch (error: any) {
+              lastError = error;
+              console.warn(`⚠️ RPC method ${String(prop)} failed on ${currentUrl}:`, error?.message || error);
+            }
+          }
+          throw lastError;
+        };
+      }
+      return value;
+    }
+  });
 };
 
 let connection = getConnection();
@@ -1378,18 +1443,23 @@ apiRouter.get("/balance", async (req, res) => {
     const keypair = Keypair.fromSecretKey(bs58.decode(tradingKey));
     console.log(">>> Fetching balance for:", keypair.publicKey.toBase58());
     
-    const balance = await withRpcRetry(async () => {
-      return await currentConnection.getBalance(keypair.publicKey);
-    }, 3, 2000);
+    let balance = 0;
+    try {
+      balance = await withRpcRetry(async () => {
+        return await currentConnection.getBalance(keypair.publicKey);
+      }, 3, 2000);
+      console.log(">>> Balance fetched:", balance);
+    } catch (rpcErr: any) {
+      console.warn("⚠️ Could not fetch balance from live RPC:", rpcErr?.message || rpcErr);
+    }
 
-    console.log(">>> Balance fetched:", balance);
     res.json({ 
       balance: balance / LAMPORTS_PER_SOL, 
       address: keypair.publicKey.toBase58() 
     });
-  } catch (error) {
-    console.error(">>> Failed to fetch balance:", error);
-    res.status(500).json({ error: "Failed to fetch balance" });
+  } catch (error: any) {
+    console.error(">>> Failed to fetch balance entirely:", error);
+    res.json({ balance: 0, address: "Error", error: error?.message || "Failed to fetch balance" });
   }
 });
 
