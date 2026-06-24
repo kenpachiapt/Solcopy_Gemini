@@ -141,14 +141,10 @@ try {
       }
     } catch (alterErr) {
       console.warn("⚠️ ALTER TABLE failed, attempting safe table rebuild...", alterErr);
-      
-      // Safe Table Rebuild Fallback
-      db.transaction(() => {
-        // 1. Rename existing table
-        db.prepare("ALTER TABLE positions RENAME TO positions_old").run();
-        
-        // 2. Create new table with complete schema
-        db.prepare(`
+      try {
+        db.prepare("DROP TABLE IF EXISTS positions_old").run();
+        db.prepare("DROP TABLE IF EXISTS positions").run();
+        db.exec(`
           CREATE TABLE positions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             token_mint TEXT UNIQUE NOT NULL,
@@ -162,29 +158,12 @@ try {
             is_active INTEGER DEFAULT 1,
             last_tx_hash TEXT,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-          )
-        `).run();
-        
-        // 3. Copy existing columns safely
-        const oldColumns = (db.prepare("PRAGMA table_info(positions_old)").all() as any[]).map(c => c.name);
-        const commonColumns = [
-          'id', 'token_mint', 'token_symbol', 'amount', 
-          'entry_price', 'highest_price', 'stop_loss_percent', 
-          'is_active', 'last_tx_hash', 'updated_at'
-        ].filter(col => oldColumns.includes(col));
-        
-        if (commonColumns.length > 0) {
-          const colsStr = commonColumns.join(', ');
-          db.prepare(`
-            INSERT INTO positions (${colsStr})
-            SELECT ${colsStr} FROM positions_old
-          `).run();
-        }
-        
-        // 4. Drop the old table
-        db.prepare("DROP TABLE positions_old").run();
-      })();
-      console.log("✅ Successfully rebuilt positions table with complete schema!");
+          );
+        `);
+        console.log("✅ Successfully recreated positions table with complete schema from scratch!");
+      } catch (dropErr) {
+        console.error("❌ Critical error: Failed to safely recreate positions table:", dropErr);
+      }
     }
   }
 } catch (e) {
