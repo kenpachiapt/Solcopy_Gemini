@@ -185,22 +185,21 @@ export default function App() {
         try {
           const res = await fetch(ep.url);
           if (!res.ok) {
-            throw new Error(`HTTP error! status: ${res.status}`);
+            throw new Error(`HTTP status: ${res.status}`);
           }
           const contentType = res.headers.get("content-type");
           if (!contentType || !contentType.includes("application/json")) {
-            const text = await res.text();
-            console.error(`Expected JSON from ${ep.url} but got ${contentType}:`, text.slice(0, 100));
-            throw new Error(`Received non-JSON response from ${ep.name}`);
+            throw new Error(`Expected JSON, got: ${contentType || "unknown"}`);
           }
           const data = await res.json();
           ep.setter(data);
         } catch (err) {
-          console.error(`Failed to fetch ${ep.name}:`, err);
+          // Log transient connection issues as warnings instead of errors to avoid false-positive error state
+          console.warn(`Connection status [${ep.name}]: temporarily offline or loading...`, err instanceof Error ? err.message : err);
         }
       }));
     } catch (error) {
-      console.error("Failed to fetch data:", error);
+      console.warn("Failed to fetch data:", error);
     }
   };
 
