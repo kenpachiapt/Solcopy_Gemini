@@ -122,52 +122,73 @@ try {
   console.error("Trades migration error:", e);
 }
 
-// Migration: Add columns to positions if they don't exist
+// Migration: Ensure all required columns exist in the positions table
 try {
-  const posColumns = db.prepare("PRAGMA table_info(positions)").all() as any[];
-  const hasAmountRaw = posColumns.some(c => c.name === 'amount_raw');
-  const hasDecimals = posColumns.some(c => c.name === 'decimals');
-  
-  if (!hasAmountRaw || !hasDecimals) {
-    console.log("🔄 Positions table is missing columns. Running robust migration...");
-    try {
-      if (!hasAmountRaw) {
-        db.prepare("ALTER TABLE positions ADD COLUMN amount_raw TEXT DEFAULT '0'").run();
-        console.log("✅ Migration: Added amount_raw column to positions table");
-      }
-      if (!hasDecimals) {
-        db.prepare("ALTER TABLE positions ADD COLUMN decimals INTEGER DEFAULT 0").run();
-        console.log("✅ Migration: Added decimals column to positions table");
-      }
-    } catch (alterErr) {
-      console.log("[Migration] Column update pending, recreating table with complete schema...");
-      try {
-        db.prepare("DROP TABLE IF EXISTS positions_old").run();
-        db.prepare("DROP TABLE IF EXISTS positions").run();
-        db.exec(`
-          CREATE TABLE positions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            token_mint TEXT UNIQUE NOT NULL,
-            token_symbol TEXT,
-            amount REAL DEFAULT 0,
-            amount_raw TEXT DEFAULT '0',
-            decimals INTEGER DEFAULT 0,
-            entry_price REAL,
-            highest_price REAL,
-            stop_loss_percent REAL DEFAULT 10,
-            is_active INTEGER DEFAULT 1,
-            last_tx_hash TEXT,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-          );
-        `);
-        console.log("✅ Successfully recreated positions table with complete schema from scratch!");
-      } catch (dropErr) {
-        console.error("❌ Critical error: Failed to safely recreate positions table:", dropErr);
-      }
+  // First, verify that the positions table itself exists
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS positions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      token_mint TEXT UNIQUE NOT NULL,
+      token_symbol TEXT,
+      amount REAL DEFAULT 0,
+      amount_raw TEXT DEFAULT '0',
+      decimals INTEGER DEFAULT 0,
+      entry_price REAL,
+      highest_price REAL,
+      stop_loss_percent REAL DEFAULT 10,
+      is_active INTEGER DEFAULT 1,
+      last_tx_hash TEXT,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  // Direct column migrations (independent TRY-CATCH blocks to ensure maximum resilience)
+  try {
+    db.prepare("ALTER TABLE positions ADD COLUMN amount_raw TEXT DEFAULT '0'").run();
+    console.log("✅ Migration: Successfully added amount_raw column to positions");
+  } catch (err: any) {
+    if (err?.message?.includes("duplicate column name")) {
+      console.log("ℹ️ amount_raw column already exists in positions table.");
+    } else {
+      throw err;
     }
   }
-} catch (e) {
-  console.error("Critical Positions migration error:", e);
+
+  try {
+    db.prepare("ALTER TABLE positions ADD COLUMN decimals INTEGER DEFAULT 0").run();
+    console.log("✅ Migration: Successfully added decimals column to positions");
+  } catch (err: any) {
+    if (err?.message?.includes("duplicate column name")) {
+      console.log("ℹ️ decimals column already exists in positions table.");
+    } else {
+      throw err;
+    }
+  }
+} catch (e: any) {
+  console.log("[Migration] Recreating positions table with the complete schema due to migration error:", e?.message || e);
+  try {
+    db.prepare("DROP TABLE IF EXISTS positions_old").run();
+    db.prepare("DROP TABLE IF EXISTS positions").run();
+    db.exec(`
+      CREATE TABLE positions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        token_mint TEXT UNIQUE NOT NULL,
+        token_symbol TEXT,
+        amount REAL DEFAULT 0,
+        amount_raw TEXT DEFAULT '0',
+        decimals INTEGER DEFAULT 0,
+        entry_price REAL,
+        highest_price REAL,
+        stop_loss_percent REAL DEFAULT 10,
+        is_active INTEGER DEFAULT 1,
+        last_tx_hash TEXT,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    console.log("✅ Successfully recreated positions table with complete schema from scratch!");
+  } catch (dropErr) {
+    console.error("❌ Critical error: Failed to safely recreate positions table:", dropErr);
+  }
 }
 
 // Solana Connection Helper
