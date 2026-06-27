@@ -11,6 +11,8 @@ import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
 
+import fs from "fs";
+
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
@@ -18,7 +20,6 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = 3000;
-const db = new Database("trading.db");
 
 // Global Request Logger
 app.use((req, res, next) => {
@@ -39,93 +40,61 @@ apiRouter.use((req, res, next) => {
   next();
 });
 
-// Initialize Database
-db.exec(`
-  CREATE TABLE IF NOT EXISTS tracked_wallets (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    address TEXT UNIQUE NOT NULL,
-    label TEXT,
-    is_active INTEGER DEFAULT 1,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+const dbPath = "trading.db";
+let db: Database.Database;
 
-  CREATE TABLE IF NOT EXISTS trades (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    wallet_address TEXT NOT NULL,
-    token_mint TEXT NOT NULL,
-    token_symbol TEXT,
-    side TEXT NOT NULL, -- 'buy' or 'sell'
-    amount_sol REAL,
-    amount_token REAL,
-    price_sol REAL,
-    tx_hash TEXT UNIQUE,
-    original_tx_hash TEXT,
-    status TEXT DEFAULT 'pending', -- 'pending', 'completed', 'failed'
-    slippage REAL,
-    fee REAL,
-    route TEXT,
-    error_message TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS positions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    token_mint TEXT UNIQUE NOT NULL,
-    token_symbol TEXT,
-    amount REAL DEFAULT 0,
-    amount_raw TEXT DEFAULT '0',
-    decimals INTEGER DEFAULT 0,
-    entry_price REAL,
-    highest_price REAL,
-    stop_loss_percent REAL DEFAULT 10,
-    is_active INTEGER DEFAULT 1,
-    last_tx_hash TEXT,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS processed_signatures (
-    signature TEXT PRIMARY KEY,
-    wallet_address TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_trades_wallet ON trades(wallet_address);
-  CREATE INDEX IF NOT EXISTS idx_trades_token ON trades(token_mint);
-`);
-
-// Migration: Add original_tx_hash if it doesn't exist
-try {
-  const columns = db.prepare("PRAGMA table_info(trades)").all() as any[];
-  const hasOriginalTxHash = columns.some(c => c.name === 'original_tx_hash');
-  if (!hasOriginalTxHash) {
-    db.prepare("ALTER TABLE trades ADD COLUMN original_tx_hash TEXT").run();
-    console.log("✅ Migration: Added original_tx_hash column to trades table");
-  }
-  
-  const hasAmountSol = columns.some(c => c.name === 'amount_sol');
-  if (!hasAmountSol) {
-    db.prepare("ALTER TABLE trades ADD COLUMN amount_sol REAL").run();
-    console.log("✅ Migration: Added amount_sol column to trades table");
+function initDatabase() {
+  try {
+    if (fs.existsSync(dbPath)) {
+      try {
+        const testDb = new Database(dbPath);
+        testDb.pragma("integrity_check");
+        testDb.close();
+      } catch (err) {
+        console.error("⚠️ Database integrity check failed! Deleting corrupt database file...", err);
+        fs.unlinkSync(dbPath);
+      }
+    }
+  } catch (fsErr) {
+    console.error("⚠️ Error while checking or deleting database file:", fsErr);
   }
 
-  const hasAmountToken = columns.some(c => c.name === 'amount_token');
-  if (!hasAmountToken) {
-    db.prepare("ALTER TABLE trades ADD COLUMN amount_token REAL").run();
-    console.log("✅ Migration: Added amount_token column to trades table");
-  }
-} catch (e) {
-  console.error("Trades migration error:", e);
-}
+  db = new Database(dbPath);
 
-// Migration: Ensure all required columns exist in the positions table
-try {
-  // First, verify that the positions table itself exists
-  db.exec(`
+  // Schema definition
+  const schema = `
+    CREATE TABLE IF NOT EXISTS tracked_wallets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      address TEXT UNIQUE NOT NULL,
+      label TEXT,
+      is_active INTEGER DEFAULT 1,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS trades (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      wallet_address TEXT NOT NULL,
+      token_mint TEXT NOT NULL,
+      token_symbol TEXT,
+      side TEXT NOT NULL, -- 'buy' or 'sell'
+      amount_sol REAL,
+      amount_token REAL,
+      price_sol REAL,
+      tx_hash TEXT UNIQUE,
+      original_tx_hash TEXT,
+      status TEXT DEFAULT 'pending', -- 'pending', 'completed', 'failed'
+      slippage REAL,
+      fee REAL,
+      route TEXT,
+      error_message TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS positions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       token_mint TEXT UNIQUE NOT NULL,
@@ -140,56 +109,92 @@ try {
       last_tx_hash TEXT,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
-  `);
 
-  // Direct column migrations (independent TRY-CATCH blocks to ensure maximum resilience)
-  try {
-    db.prepare("ALTER TABLE positions ADD COLUMN amount_raw TEXT DEFAULT '0'").run();
-    console.log("✅ Migration: Successfully added amount_raw column to positions");
-  } catch (err: any) {
-    if (err?.message?.includes("duplicate column name")) {
-      console.log("ℹ️ amount_raw column already exists in positions table.");
-    } else {
-      throw err;
-    }
-  }
+    CREATE TABLE IF NOT EXISTS processed_signatures (
+      signature TEXT PRIMARY KEY,
+      wallet_address TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_trades_wallet ON trades(wallet_address);
+    CREATE INDEX IF NOT EXISTS idx_trades_token ON trades(token_mint);
+  `;
 
   try {
-    db.prepare("ALTER TABLE positions ADD COLUMN decimals INTEGER DEFAULT 0").run();
-    console.log("✅ Migration: Successfully added decimals column to positions");
+    db.exec(schema);
+    console.log("✅ Core database tables ensured.");
   } catch (err: any) {
-    if (err?.message?.includes("duplicate column name")) {
-      console.log("ℹ️ decimals column already exists in positions table.");
-    } else {
-      throw err;
+    console.error("⚠️ Failed to execute core database schema, recreating trading.db...", err);
+    try {
+      db.close();
+      if (fs.existsSync(dbPath)) {
+        fs.unlinkSync(dbPath);
+      }
+    } catch (e) {
+      console.error("Failed to delete trading.db on schema error:", e);
     }
+    db = new Database(dbPath);
+    db.exec(schema);
   }
-} catch (e: any) {
-  console.log("[Migration] Recreating positions table with the complete schema due to migration error:", e?.message || e);
+
+  // Sanity check: ensure positions table has decimals and amount_raw columns.
+  // If not, we drop and recreate the positions table.
   try {
-    db.prepare("DROP TABLE IF EXISTS positions_old").run();
-    db.prepare("DROP TABLE IF EXISTS positions").run();
-    db.exec(`
-      CREATE TABLE positions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        token_mint TEXT UNIQUE NOT NULL,
-        token_symbol TEXT,
-        amount REAL DEFAULT 0,
-        amount_raw TEXT DEFAULT '0',
-        decimals INTEGER DEFAULT 0,
-        entry_price REAL,
-        highest_price REAL,
-        stop_loss_percent REAL DEFAULT 10,
-        is_active INTEGER DEFAULT 1,
-        last_tx_hash TEXT,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-    console.log("✅ Successfully recreated positions table with complete schema from scratch!");
-  } catch (dropErr) {
-    console.error("❌ Critical error: Failed to safely recreate positions table:", dropErr);
+    const columns = db.prepare("PRAGMA table_info(positions)").all() as any[];
+    const hasAmountRaw = columns.some(c => c.name === "amount_raw");
+    const hasDecimals = columns.some(c => c.name === "decimals");
+    if (!hasAmountRaw || !hasDecimals) {
+      console.log("⚠️ Missing essential columns (amount_raw/decimals) in positions table. Recreating...");
+      db.exec("DROP TABLE IF EXISTS positions_old");
+      db.exec("DROP TABLE IF EXISTS positions");
+      db.exec(`
+        CREATE TABLE positions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          token_mint TEXT UNIQUE NOT NULL,
+          token_symbol TEXT,
+          amount REAL DEFAULT 0,
+          amount_raw TEXT DEFAULT '0',
+          decimals INTEGER DEFAULT 0,
+          entry_price REAL,
+          highest_price REAL,
+          stop_loss_percent REAL DEFAULT 10,
+          is_active INTEGER DEFAULT 1,
+          last_tx_hash TEXT,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+      console.log("✅ Recreated positions table with complete schema.");
+    }
+  } catch (err) {
+    console.error("⚠️ Failed during positions table sanity check:", err);
+  }
+
+  // Ensure trades table has correct columns (migrations)
+  try {
+    const columns = db.prepare("PRAGMA table_info(trades)").all() as any[];
+    const hasOriginalTxHash = columns.some(c => c.name === 'original_tx_hash');
+    if (!hasOriginalTxHash) {
+      db.prepare("ALTER TABLE trades ADD COLUMN original_tx_hash TEXT").run();
+      console.log("✅ Migration: Added original_tx_hash column to trades table");
+    }
+    
+    const hasAmountSol = columns.some(c => c.name === 'amount_sol');
+    if (!hasAmountSol) {
+      db.prepare("ALTER TABLE trades ADD COLUMN amount_sol REAL").run();
+      console.log("✅ Migration: Added amount_sol column to trades table");
+    }
+
+    const hasAmountToken = columns.some(c => c.name === 'amount_token');
+    if (!hasAmountToken) {
+      db.prepare("ALTER TABLE trades ADD COLUMN amount_token REAL").run();
+      console.log("✅ Migration: Added amount_token column to trades table");
+    }
+  } catch (err) {
+    console.error("⚠️ Failed during trades table migration:", err);
   }
 }
+
+initDatabase();
 
 // Solana Connection Helper
 let activeRpcIndex = 0;
