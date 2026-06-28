@@ -225,64 +225,105 @@ const getRpcUrls = (): string[] => {
   return urls;
 };
 
+// Map of subscription ID to the specific Connection instance it was registered on
+const subscriptionConnections = new Map<number, Connection>();
+
 const getConnection = (): Connection => {
   const urls = getRpcUrls();
-  const baseConnection = new Connection(urls[0] || "https://api.mainnet-beta.solana.com", "confirmed");
+  const connectionInstances = urls.map(url => new Connection(url, "confirmed"));
+  const baseConnection = connectionInstances[0] || new Connection("https://api.mainnet-beta.solana.com", "confirmed");
   
   return new Proxy(baseConnection, {
     get(target, prop, receiver) {
-      const activeUrl = urls[activeRpcIndex % urls.length];
-      const actualConnection = new Connection(activeUrl, "confirmed");
-      
-      const value = Reflect.get(actualConnection, prop);
-      if (typeof value === 'function') {
-        const isSubscriptionMethod = typeof prop === 'string' && (prop.startsWith('on') || prop.includes('Listener'));
-        if (isSubscriptionMethod) {
-          return value.bind(actualConnection);
-        }
-        
-        return async function(...args: any[]) {
-          let lastError: any;
-          // Try multiple times, rotating through all available endpoints and backing off on rate limits
-          const maxAttempts = Math.max(8, urls.length * 2);
-          for (let attempt = 0; attempt < maxAttempts; attempt++) {
-            const currentIdx = (activeRpcIndex + attempt) % urls.length;
-            const currentUrl = urls[currentIdx];
-            const conn = new Connection(currentUrl, "confirmed");
+      // Return normal properties/fields if not functions
+      const baseValue = Reflect.get(baseConnection, prop);
+      if (typeof baseValue !== 'function') {
+        return baseValue;
+      }
+
+      const propStr = String(prop);
+
+      // Handle subscription removal method
+      if (propStr === 'removeOnLogsListener' || (propStr.startsWith('remove') && propStr.includes('Listener'))) {
+        return function(subId: number, ...args: any[]) {
+          const conn = subscriptionConnections.get(subId);
+          if (conn) {
+            subscriptionConnections.delete(subId);
             try {
               const method = Reflect.get(conn, prop);
-              const result = await method.apply(conn, args);
-              if (currentIdx !== activeRpcIndex) {
-                activeRpcIndex = currentIdx;
-                console.log(`🔄 Rotated active Solana RPC to: ${currentUrl}`);
+              return method.call(conn, subId, ...args);
+            } catch (err) {
+              console.error(`[RPC] Error removing listener ${subId} from original connection:`, err);
+            }
+          } else {
+            // Fallback to all connections just in case
+            for (const c of connectionInstances) {
+              try {
+                const method = Reflect.get(c, prop);
+                method.call(c, subId, ...args);
+              } catch (e) {
+                // Ignore since it might not exist on other instances
               }
-              return result;
-            } catch (error: any) {
-              lastError = error;
-              
-              const errMsg = String(error?.message || error).toLowerCase();
-              const isRateLimit = errMsg.includes("429") || 
-                                  errMsg.includes("rate limit") || 
-                                  errMsg.includes("too many requests") || 
-                                  errMsg.includes("32429") ||
-                                  (error?.code === -32429);
-              
-              if (isRateLimit) {
-                // Exponential backoff with random jitter
-                const backoffMs = Math.min(10000, Math.pow(1.5, attempt) * 1000 + Math.random() * 500);
-                console.warn(`[RPC RateLimit] ⚠️ Hit rate limit on ${currentUrl} for method '${String(prop)}'. Sleeping ${Math.round(backoffMs)}ms before retry...`);
-                await new Promise(resolve => setTimeout(resolve, backoffMs));
-              } else {
-                // Standard network or node error. Small sleep before rotating to avoid tight loop
-                await new Promise(resolve => setTimeout(resolve, 200));
-              }
-              console.log(`[RPC] Method '${String(prop)}' failed on ${currentUrl}. Error: ${errMsg.slice(0, 100)}. Trying fallback...`);
             }
           }
-          throw lastError;
         };
       }
-      return value;
+
+      // Handle subscription registration methods (starts with 'on' or contains 'Listener')
+      const isSubscriptionMethod = propStr.startsWith('on') || (propStr.startsWith('add') && propStr.includes('Listener'));
+      if (isSubscriptionMethod) {
+        return function(...args: any[]) {
+          // Use currently active connection for new subscription
+          const conn = connectionInstances[activeRpcIndex % connectionInstances.length];
+          const method = Reflect.get(conn, prop);
+          const subId = method.apply(conn, args);
+          if (typeof subId === 'number') {
+            subscriptionConnections.set(subId, conn);
+          }
+          return subId;
+        };
+      }
+
+      // Handle regular RPC methods with rotating retry
+      return async function(...args: any[]) {
+        let lastError: any;
+        const maxAttempts = Math.max(8, connectionInstances.length * 2);
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          const currentIdx = (activeRpcIndex + attempt) % connectionInstances.length;
+          const conn = connectionInstances[currentIdx];
+          const currentUrl = urls[currentIdx];
+          try {
+            const method = Reflect.get(conn, prop);
+            const result = await method.apply(conn, args);
+            if (currentIdx !== activeRpcIndex) {
+              activeRpcIndex = currentIdx;
+              console.log(`🔄 Rotated active Solana RPC to: ${currentUrl}`);
+            }
+            return result;
+          } catch (error: any) {
+            lastError = error;
+            
+            const errMsg = String(error?.message || error).toLowerCase();
+            const isRateLimit = errMsg.includes("429") || 
+                                errMsg.includes("rate limit") || 
+                                errMsg.includes("too many requests") || 
+                                errMsg.includes("32429") ||
+                                (error?.code === -32429);
+            
+            if (isRateLimit) {
+              // Exponential backoff with random jitter
+              const backoffMs = Math.min(10000, Math.pow(1.5, attempt) * 1000 + Math.random() * 500);
+              console.warn(`[RPC RateLimit] ⚠️ Hit rate limit on ${currentUrl} for method '${propStr}'. Sleeping ${Math.round(backoffMs)}ms before retry...`);
+              await new Promise(resolve => setTimeout(resolve, backoffMs));
+            } else {
+              // Standard network or node error. Small sleep before rotating to avoid tight loop
+              await new Promise(resolve => setTimeout(resolve, 200));
+            }
+            console.log(`[RPC] Method '${propStr}' failed on ${currentUrl}. Error: ${errMsg.slice(0, 100)}. Trying fallback...`);
+          }
+        }
+        throw lastError;
+      };
     }
   });
 };
