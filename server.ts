@@ -12,6 +12,11 @@ import path from "path";
 import { fileURLToPath } from "url";
 
 import fs from "fs";
+import dns from "dns";
+
+if (dns && typeof dns.setDefaultResultOrder === "function") {
+  dns.setDefaultResultOrder("ipv4first");
+}
 
 dotenv.config();
 
@@ -225,13 +230,83 @@ const getRpcUrls = (): string[] => {
   return urls;
 };
 
+const customFetch = async (input: any, init: any): Promise<any> => {
+  const url = typeof input === "string" ? input : (input.url || String(input));
+  const headers = init?.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+  
+  try {
+    const response = await axios({
+      method: init?.method || "GET",
+      url,
+      data: init?.body,
+      headers,
+      timeout: 15000,
+      responseType: "text",
+    });
+
+    const getResponseHeaders = (axiosHeaders: any) => {
+      if (typeof Headers !== "undefined") {
+        return new Headers(axiosHeaders as any);
+      }
+      return {
+        get: (key: string) => axiosHeaders[key.toLowerCase()] || null,
+        entries: () => Object.entries(axiosHeaders),
+      } as any;
+    };
+
+    return {
+      ok: response.status >= 200 && response.status < 300,
+      status: response.status,
+      statusText: response.statusText,
+      headers: getResponseHeaders(response.headers),
+      text: async () => response.data,
+      json: async () => {
+        try {
+          return typeof response.data === "string" ? JSON.parse(response.data) : response.data;
+        } catch (e) {
+          return response.data;
+        }
+      },
+      blob: async () => new Blob([response.data]),
+    };
+  } catch (error: any) {
+    if (error.response) {
+      const resp = error.response;
+      const getResponseHeaders = (axiosHeaders: any) => {
+        if (typeof Headers !== "undefined") {
+          return new Headers(axiosHeaders as any);
+        }
+        return {
+          get: (key: string) => axiosHeaders[key.toLowerCase()] || null,
+          entries: () => Object.entries(axiosHeaders),
+        } as any;
+      };
+      return {
+        ok: resp.status >= 200 && resp.status < 300,
+        status: resp.status,
+        statusText: resp.statusText,
+        headers: getResponseHeaders(resp.headers),
+        text: async () => typeof resp.data === "string" ? resp.data : JSON.stringify(resp.data),
+        json: async () => resp.data,
+      };
+    }
+    throw error;
+  }
+};
+
 // Map of subscription ID to the specific Connection instance it was registered on
 const subscriptionConnections = new Map<number, Connection>();
 
 const getConnection = (): Connection => {
   const urls = getRpcUrls();
-  const connectionInstances = urls.map(url => new Connection(url, "confirmed"));
-  const baseConnection = connectionInstances[0] || new Connection("https://api.mainnet-beta.solana.com", "confirmed");
+  const connectionInstances = urls.map(url => new Connection(url, {
+    commitment: "confirmed",
+    fetch: customFetch
+  }));
+  const baseConnection = connectionInstances[0] || new Connection("https://api.mainnet-beta.solana.com", {
+    commitment: "confirmed",
+    fetch: customFetch
+  });
   
   return new Proxy(baseConnection, {
     get(target, prop, receiver) {
