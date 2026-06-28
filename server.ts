@@ -208,12 +208,11 @@ const getRpcUrls = (): string[] => {
     urls.push(userRpc);
   }
   
-  // Public fallbacks (Ankr, Solana Public-RPC, Mainnet-Beta, etc.)
+  // Public fallbacks (only working, high-performance public RPCs)
   const fallbacks = [
-    "https://rpc.ankr.com/solana",
-    "https://solana.public-rpc.com",
-    "https://api.mainnet-beta.solana.com",
+    "https://solana-rpc.publicnode.com",
     "https://api.mainnet.solana.com",
+    "https://api.mainnet-beta.solana.com",
   ];
   
   for (const fb of fallbacks) {
