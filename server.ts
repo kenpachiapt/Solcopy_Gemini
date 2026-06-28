@@ -211,6 +211,7 @@ const getRpcUrls = (): string[] => {
   // Public fallbacks (only working, high-performance public RPCs)
   const fallbacks = [
     "https://solana-rpc.publicnode.com",
+    "https://solana.publicnode.com",
     "https://api.mainnet.solana.com",
     "https://api.mainnet-beta.solana.com",
   ];
@@ -242,22 +243,40 @@ const getConnection = (): Connection => {
         
         return async function(...args: any[]) {
           let lastError: any;
-          for (let attempt = 0; attempt < Math.min(4, urls.length); attempt++) {
+          // Try multiple times, rotating through all available endpoints and backing off on rate limits
+          const maxAttempts = Math.max(8, urls.length * 2);
+          for (let attempt = 0; attempt < maxAttempts; attempt++) {
             const currentIdx = (activeRpcIndex + attempt) % urls.length;
             const currentUrl = urls[currentIdx];
             const conn = new Connection(currentUrl, "confirmed");
             try {
               const method = Reflect.get(conn, prop);
               const result = await method.apply(conn, args);
-              if (attempt > 0) {
+              if (currentIdx !== activeRpcIndex) {
                 activeRpcIndex = currentIdx;
                 console.log(`🔄 Rotated active Solana RPC to: ${currentUrl}`);
               }
               return result;
             } catch (error: any) {
               lastError = error;
-              // Silent retry logic to prevent test runner parsing false-positives
-              console.log(`[RPC] Method ${String(prop)} returned status: checking fallback...`);
+              
+              const errMsg = String(error?.message || error).toLowerCase();
+              const isRateLimit = errMsg.includes("429") || 
+                                  errMsg.includes("rate limit") || 
+                                  errMsg.includes("too many requests") || 
+                                  errMsg.includes("32429") ||
+                                  (error?.code === -32429);
+              
+              if (isRateLimit) {
+                // Exponential backoff with random jitter
+                const backoffMs = Math.min(10000, Math.pow(1.5, attempt) * 1000 + Math.random() * 500);
+                console.warn(`[RPC RateLimit] ⚠️ Hit rate limit on ${currentUrl} for method '${String(prop)}'. Sleeping ${Math.round(backoffMs)}ms before retry...`);
+                await new Promise(resolve => setTimeout(resolve, backoffMs));
+              } else {
+                // Standard network or node error. Small sleep before rotating to avoid tight loop
+                await new Promise(resolve => setTimeout(resolve, 200));
+              }
+              console.log(`[RPC] Method '${String(prop)}' failed on ${currentUrl}. Error: ${errMsg.slice(0, 100)}. Trying fallback...`);
             }
           }
           throw lastError;
