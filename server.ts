@@ -143,13 +143,35 @@ function initDatabase() {
   }
 
   // Sanity check: ensure positions table has decimals and amount_raw columns.
-  // If not, we drop and recreate the positions table.
+  // We first try to ALTER the table to add these columns safely if they are missing (retaining data).
+  // If the ALTER fails or is impossible, we fall back to dropping and recreating the positions table.
   try {
     const columns = db.prepare("PRAGMA table_info(positions)").all() as any[];
-    const hasAmountRaw = columns.some(c => c.name === "amount_raw");
-    const hasDecimals = columns.some(c => c.name === "decimals");
+    let hasAmountRaw = columns.some(c => c.name === "amount_raw");
+    let hasDecimals = columns.some(c => c.name === "decimals");
+
+    if (!hasAmountRaw) {
+      try {
+        db.prepare("ALTER TABLE positions ADD COLUMN amount_raw TEXT DEFAULT '0'").run();
+        console.log("✅ Migration: Added amount_raw column to positions table successfully");
+        hasAmountRaw = true;
+      } catch (alterErr) {
+        console.warn("⚠️ Failed to ALTER table positions to add amount_raw, will try recreating if necessary:", alterErr);
+      }
+    }
+
+    if (!hasDecimals) {
+      try {
+        db.prepare("ALTER TABLE positions ADD COLUMN decimals INTEGER DEFAULT 0").run();
+        console.log("✅ Migration: Added decimals column to positions table successfully");
+        hasDecimals = true;
+      } catch (alterErr) {
+        console.warn("⚠️ Failed to ALTER table positions to add decimals, will try recreating if necessary:", alterErr);
+      }
+    }
+
     if (!hasAmountRaw || !hasDecimals) {
-      console.log("⚠️ Missing essential columns (amount_raw/decimals) in positions table. Recreating...");
+      console.log("⚠️ Missing essential columns (amount_raw/decimals) in positions table and alter failed. Recreating...");
       db.exec("DROP TABLE IF EXISTS positions_old");
       db.exec("DROP TABLE IF EXISTS positions");
       db.exec(`
@@ -171,7 +193,7 @@ function initDatabase() {
       console.log("✅ Recreated positions table with complete schema.");
     }
   } catch (err) {
-    console.error("⚠️ Failed during positions table sanity check:", err);
+    console.error("⚠️ Failed during positions table sanity check/migration:", err);
   }
 
   // Ensure trades table has correct columns (migrations)
@@ -230,83 +252,13 @@ const getRpcUrls = (): string[] => {
   return urls;
 };
 
-const customFetch = async (input: any, init: any): Promise<any> => {
-  const url = typeof input === "string" ? input : (input.url || String(input));
-  const headers = init?.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
-  
-  try {
-    const response = await axios({
-      method: init?.method || "GET",
-      url,
-      data: init?.body,
-      headers,
-      timeout: 15000,
-      responseType: "text",
-    });
-
-    const getResponseHeaders = (axiosHeaders: any) => {
-      if (typeof Headers !== "undefined") {
-        return new Headers(axiosHeaders as any);
-      }
-      return {
-        get: (key: string) => axiosHeaders[key.toLowerCase()] || null,
-        entries: () => Object.entries(axiosHeaders),
-      } as any;
-    };
-
-    return {
-      ok: response.status >= 200 && response.status < 300,
-      status: response.status,
-      statusText: response.statusText,
-      headers: getResponseHeaders(response.headers),
-      text: async () => response.data,
-      json: async () => {
-        try {
-          return typeof response.data === "string" ? JSON.parse(response.data) : response.data;
-        } catch (e) {
-          return response.data;
-        }
-      },
-      blob: async () => new Blob([response.data]),
-    };
-  } catch (error: any) {
-    if (error.response) {
-      const resp = error.response;
-      const getResponseHeaders = (axiosHeaders: any) => {
-        if (typeof Headers !== "undefined") {
-          return new Headers(axiosHeaders as any);
-        }
-        return {
-          get: (key: string) => axiosHeaders[key.toLowerCase()] || null,
-          entries: () => Object.entries(axiosHeaders),
-        } as any;
-      };
-      return {
-        ok: resp.status >= 200 && resp.status < 300,
-        status: resp.status,
-        statusText: resp.statusText,
-        headers: getResponseHeaders(resp.headers),
-        text: async () => typeof resp.data === "string" ? resp.data : JSON.stringify(resp.data),
-        json: async () => resp.data,
-      };
-    }
-    throw error;
-  }
-};
-
 // Map of subscription ID to the specific Connection instance it was registered on
 const subscriptionConnections = new Map<number, Connection>();
 
 const getConnection = (): Connection => {
   const urls = getRpcUrls();
-  const connectionInstances = urls.map(url => new Connection(url, {
-    commitment: "confirmed",
-    fetch: customFetch
-  }));
-  const baseConnection = connectionInstances[0] || new Connection("https://api.mainnet-beta.solana.com", {
-    commitment: "confirmed",
-    fetch: customFetch
-  });
+  const connectionInstances = urls.map(url => new Connection(url, "confirmed"));
+  const baseConnection = connectionInstances[0] || new Connection("https://api.mainnet-beta.solana.com", "confirmed");
   
   return new Proxy(baseConnection, {
     get(target, prop, receiver) {
@@ -359,44 +311,43 @@ const getConnection = (): Connection => {
         };
       }
 
-      // Handle regular RPC methods with rotating retry
+      // Handle regular RPC methods with rotating retry (highly resilient, zero-delay rotation)
       return async function(...args: any[]) {
         let lastError: any;
-        const maxAttempts = Math.max(8, connectionInstances.length * 2);
-        for (let attempt = 0; attempt < maxAttempts; attempt++) {
-          const currentIdx = (activeRpcIndex + attempt) % connectionInstances.length;
-          const conn = connectionInstances[currentIdx];
-          const currentUrl = urls[currentIdx];
-          try {
-            const method = Reflect.get(conn, prop);
-            const result = await method.apply(conn, args);
-            if (currentIdx !== activeRpcIndex) {
-              activeRpcIndex = currentIdx;
-              console.log(`🔄 Rotated active Solana RPC to: ${currentUrl}`);
-            }
-            return result;
-          } catch (error: any) {
-            lastError = error;
+        const totalNodes = connectionInstances.length;
+        const maxCycles = 4; // Try up to 4 complete rotation cycles of all endpoints
+        
+        for (let cycle = 0; cycle < maxCycles; cycle++) {
+          for (let nodeOffset = 0; nodeOffset < totalNodes; nodeOffset++) {
+            const currentIdx = (activeRpcIndex + nodeOffset) % totalNodes;
+            const conn = connectionInstances[currentIdx];
+            const currentUrl = urls[currentIdx];
             
-            const errMsg = String(error?.message || error).toLowerCase();
-            const isRateLimit = errMsg.includes("429") || 
-                                errMsg.includes("rate limit") || 
-                                errMsg.includes("too many requests") || 
-                                errMsg.includes("32429") ||
-                                (error?.code === -32429);
-            
-            if (isRateLimit) {
-              // Exponential backoff with random jitter
-              const backoffMs = Math.min(10000, Math.pow(1.5, attempt) * 1000 + Math.random() * 500);
-              console.warn(`[RPC RateLimit] ⚠️ Hit rate limit on ${currentUrl} for method '${propStr}'. Sleeping ${Math.round(backoffMs)}ms before retry...`);
-              await new Promise(resolve => setTimeout(resolve, backoffMs));
-            } else {
-              // Standard network or node error. Small sleep before rotating to avoid tight loop
-              await new Promise(resolve => setTimeout(resolve, 200));
+            try {
+              const method = Reflect.get(conn, prop);
+              const result = await method.apply(conn, args);
+              
+              // On success, update active Rpc Index so subsequent calls start here
+              if (currentIdx !== activeRpcIndex) {
+                activeRpcIndex = currentIdx;
+                console.log(`🔄 Rotated active Solana RPC to: ${currentUrl}`);
+              }
+              return result;
+            } catch (error: any) {
+              lastError = error;
+              const errMsg = String(error?.message || error).toLowerCase();
+              console.log(`[RPC] Method '${propStr}' failed on ${currentUrl}. Error: ${errMsg.slice(0, 100)}. Rotating instantly...`);
             }
-            console.log(`[RPC] Method '${propStr}' failed on ${currentUrl}. Error: ${errMsg.slice(0, 100)}. Trying fallback...`);
+          }
+          
+          // If we completed a full cycle and all nodes failed, back off before the next cycle
+          if (cycle < maxCycles - 1) {
+            const backoffMs = Math.min(8000, Math.pow(2, cycle) * 1000 + Math.random() * 500);
+            console.warn(`[RPC Exhausted] ⚠️ All ${totalNodes} RPC endpoints failed or rate-limited. Sleeping ${Math.round(backoffMs)}ms before retry cycle ${cycle + 2}/${maxCycles}...`);
+            await new Promise(resolve => setTimeout(resolve, backoffMs));
           }
         }
+        
         throw lastError;
       };
     }
@@ -672,7 +623,38 @@ const startMonitoring = async () => {
       try {
         const pubkey = new PublicKey(wallet.address);
         const subId = connection.onLogs(pubkey, async (logs, ctx) => {
-          console.log(`⚡ Activity detected on wallet: ${wallet.address} | Sig: ${logs.signature}`);
+          if (logs.err) {
+            // Transaction failed on-chain, skip parsing details entirely
+            return;
+          }
+
+          // Known DEX Program IDs or standard swap logs
+          const DEX_PROGRAM_IDS = [
+            "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", // Raydium
+            "JUP6LkbZbjS1jKKccR4gc2YEDXAD99D4399e2HBaDbi", // Jupiter V6
+            "JUP4b99eR96sS7XmS9y4f2A9T6v48WqTLv7BBPEu38", // Jupiter V4
+            "6EF8rrecthR5DkZJvE6zW669X9h2u7536t292L37", // Pump.fun
+            "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc", // Orca
+            "CAMMCzoZ7NrM3qGgU2dHnwwRTVYmGSC1nvhvNc9vM7h", // Meteora
+            "L33p969p4X3Yp5Gf7f7H7f7H7f7H7f7H7f7H7f7H7f7", // Lifinity
+            "FLUXubRmk97VqcyP95f59K73p7c9p9p9p9p9p9p9p", // Fluxbeam
+            "PHOENicpXpXpXpXpXpXpXpXpXpXpXpXpXpXpXpXpXpX", // Phoenix
+            "srmqPvS2o3Y955vLnWxS4D9S1WpGk9p9p9p9p9p9p9p"  // OpenBook
+          ];
+
+          const hasDexActivity = logs.logs && logs.logs.some(log => 
+            DEX_PROGRAM_IDS.some(id => log.includes(id)) || 
+            log.toLowerCase().includes("swap") ||
+            log.toLowerCase().includes("buy") ||
+            log.toLowerCase().includes("sell")
+          );
+
+          if (!hasDexActivity) {
+            console.log(`ℹ️ Activity on ${wallet.address} has no DEX/Swap indicators in logs. Skipping.`);
+            return;
+          }
+
+          console.log(`⚡ Swap/DEX Activity detected on wallet: ${wallet.address} | Sig: ${logs.signature}`);
           await processTransaction(logs.signature, wallet.address);
         }, "confirmed");
         activeSubscriptions.set(wallet.address, subId);
@@ -1617,6 +1599,10 @@ apiRouter.get("/trades", (req, res) => {
   }
 });
 
+let cachedSolBalance: number | null = null;
+let lastSolBalanceFetch = 0;
+const SOL_BALANCE_CACHE_TTL = 15000; // 15 seconds cache
+
 apiRouter.get("/balance", async (req, res) => {
   console.log(">>> GET /api/balance");
   try {
@@ -1634,25 +1620,65 @@ apiRouter.get("/balance", async (req, res) => {
     }
 
     const keypair = Keypair.fromSecretKey(bs58.decode(tradingKey));
-    console.log(">>> Fetching balance for:", keypair.publicKey.toBase58());
-    
+    const address = keypair.publicKey.toBase58();
+    console.log(">>> Fetching balance for:", address);
+
+    const now = Date.now();
+    // Return cached balance if fresh
+    if (cachedSolBalance !== null && (now - lastSolBalanceFetch < SOL_BALANCE_CACHE_TTL)) {
+      console.log(">>> Returning cached balance:", cachedSolBalance);
+      return res.json({ 
+        balance: cachedSolBalance, 
+        address 
+      });
+    }
+
     let balance = 0;
+    let success = false;
     try {
       balance = await withRpcRetry(async () => {
         return await currentConnection.getBalance(keypair.publicKey);
-      }, 3, 2000);
+      }, 3, 1000);
+      cachedSolBalance = balance / LAMPORTS_PER_SOL;
+      lastSolBalanceFetch = now;
+      success = true;
       console.log(">>> Balance fetched:", balance);
     } catch (rpcErr: any) {
       console.log(`[RPC] Balance lookup status: deferred (${rpcErr?.message || rpcErr})`);
     }
 
+    // Fall back to stale cache if current request failed
+    if (!success && cachedSolBalance !== null) {
+      console.log(">>> Returning last known stale cached balance:", cachedSolBalance);
+      return res.json({
+        balance: cachedSolBalance,
+        address
+      });
+    }
+
     res.json({ 
-      balance: balance / LAMPORTS_PER_SOL, 
-      address: keypair.publicKey.toBase58() 
+      balance: success ? (balance / LAMPORTS_PER_SOL) : 0, 
+      address 
     });
   } catch (error: any) {
     console.log("[BalanceAPI] Fetch status: deferred");
-    res.json({ balance: 0, address: "Error", error: error?.message || "Unavailable" });
+    // Under any failure, if we can parse the key, try to at least provide the derived address to avoid UI "Ayarlanmadı" state
+    try {
+      const settings = db.prepare("SELECT * FROM settings").all() as { key: string, value: string }[];
+      const settingsMap = settings.reduce((acc: any, curr: any) => {
+        acc[curr.key] = curr.value;
+        return acc;
+      }, {});
+      const tradingKey = settingsMap.trading_keypair || process.env.PRIVATE_KEY || process.env.TRADING_KEYPAIR;
+      if (tradingKey) {
+        const keypair = Keypair.fromSecretKey(bs58.decode(tradingKey));
+        return res.json({
+          balance: cachedSolBalance !== null ? cachedSolBalance : 0,
+          address: keypair.publicKey.toBase58()
+        });
+      }
+    } catch (e) {}
+    res.json({ balance: 0, address: "Error" });
   }
 });
 
