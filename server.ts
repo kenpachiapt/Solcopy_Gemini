@@ -256,6 +256,12 @@ function initDatabase() {
       db.prepare("ALTER TABLE trades ADD COLUMN amount_token REAL").run();
       console.log("✅ Migration: Added amount_token column to trades table");
     }
+
+    const hasErrorMessage = columns.some(c => c.name === 'error_message');
+    if (!hasErrorMessage) {
+      db.prepare("ALTER TABLE trades ADD COLUMN error_message TEXT").run();
+      console.log("✅ Migration: Added error_message column to trades table");
+    }
   } catch (err) {
     console.error("⚠️ Failed during trades table migration:", err);
   }
