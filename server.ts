@@ -144,55 +144,95 @@ function initDatabase() {
 
   // Sanity check: ensure positions table has decimals and amount_raw columns.
   // We first try to ALTER the table to add these columns safely if they are missing (retaining data).
-  // If the ALTER fails or is impossible, we fall back to dropping and recreating the positions table.
+  // If the ALTER fails or is impossible, we fall back to a robust table reconstruction (retaining all data).
   try {
+    console.log("🔍 Checking positions table schema on startup...");
     const columns = db.prepare("PRAGMA table_info(positions)").all() as any[];
     let hasAmountRaw = columns.some(c => c.name === "amount_raw");
     let hasDecimals = columns.some(c => c.name === "decimals");
 
-    if (!hasAmountRaw) {
-      try {
-        db.prepare("ALTER TABLE positions ADD COLUMN amount_raw TEXT DEFAULT '0'").run();
-        console.log("✅ Migration: Added amount_raw column to positions table successfully");
-        hasAmountRaw = true;
-      } catch (alterErr) {
-        console.warn("⚠️ Failed to ALTER table positions to add amount_raw, will try recreating if necessary:", alterErr);
-      }
-    }
-
-    if (!hasDecimals) {
-      try {
-        db.prepare("ALTER TABLE positions ADD COLUMN decimals INTEGER DEFAULT 0").run();
-        console.log("✅ Migration: Added decimals column to positions table successfully");
-        hasDecimals = true;
-      } catch (alterErr) {
-        console.warn("⚠️ Failed to ALTER table positions to add decimals, will try recreating if necessary:", alterErr);
-      }
-    }
-
     if (!hasAmountRaw || !hasDecimals) {
-      console.log("⚠️ Missing essential columns (amount_raw/decimals) in positions table and alter failed. Recreating...");
-      db.exec("DROP TABLE IF EXISTS positions_old");
-      db.exec("DROP TABLE IF EXISTS positions");
-      db.exec(`
-        CREATE TABLE positions (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          token_mint TEXT UNIQUE NOT NULL,
-          token_symbol TEXT,
-          amount REAL DEFAULT 0,
-          amount_raw TEXT DEFAULT '0',
-          decimals INTEGER DEFAULT 0,
-          entry_price REAL,
-          highest_price REAL,
-          stop_loss_percent REAL DEFAULT 10,
-          is_active INTEGER DEFAULT 1,
-          last_tx_hash TEXT,
-          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        );
-      `);
-      console.log("✅ Recreated positions table with complete schema.");
+      console.log(`⚠️ Missing essential columns (amount_raw: ${hasAmountRaw}, decimals: ${hasDecimals}) in positions table. Migrating...`);
+      
+      // Try safe ALTER first
+      let alterSuccess = true;
+      if (!hasAmountRaw) {
+        try {
+          db.prepare("ALTER TABLE positions ADD COLUMN amount_raw TEXT DEFAULT '0'").run();
+          console.log("✅ Migration: Added amount_raw column via ALTER TABLE");
+          hasAmountRaw = true;
+        } catch (alterErr: any) {
+          console.error("⚠️ Failed to ALTER table positions to add amount_raw:", alterErr.message);
+          alterSuccess = false;
+        }
+      }
+      
+      if (!hasDecimals) {
+        try {
+          db.prepare("ALTER TABLE positions ADD COLUMN decimals INTEGER DEFAULT 0").run();
+          console.log("✅ Migration: Added decimals column via ALTER TABLE");
+          hasDecimals = true;
+        } catch (alterErr: any) {
+          console.error("⚠️ Failed to ALTER table positions to add decimals:", alterErr.message);
+          alterSuccess = false;
+        }
+      }
+
+      // If ALTER failed, do a robust, data-preserving table reconstruction
+      if (!alterSuccess || !hasAmountRaw || !hasDecimals) {
+        console.log("🔄 Performing robust database table reconstruction to avoid any data loss...");
+        db.transaction(() => {
+          // 1. Rename existing table to backup
+          db.exec("DROP TABLE IF EXISTS positions_backup;");
+          db.exec("ALTER TABLE positions RENAME TO positions_backup;");
+          
+          // 2. Create the new table with correct schema
+          db.exec(`
+            CREATE TABLE positions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              token_mint TEXT UNIQUE NOT NULL,
+              token_symbol TEXT,
+              amount REAL DEFAULT 0,
+              amount_raw TEXT DEFAULT '0',
+              decimals INTEGER DEFAULT 0,
+              entry_price REAL,
+              highest_price REAL,
+              stop_loss_percent REAL DEFAULT 10,
+              is_active INTEGER DEFAULT 1,
+              last_tx_hash TEXT,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+          `);
+          
+          // 3. Copy data from backup to new table
+          const backupCols = db.prepare("PRAGMA table_info(positions_backup)").all() as any[];
+          const backupColNames = backupCols.map(c => c.name);
+          
+          const commonCols = [
+            "id", "token_mint", "token_symbol", "amount", 
+            "entry_price", "highest_price", "stop_loss_percent", 
+            "is_active", "last_tx_hash", "updated_at"
+          ].filter(c => backupColNames.includes(c));
+          
+          const selectCols = commonCols.join(", ");
+          const insertCols = commonCols.join(", ");
+          
+          if (commonCols.length > 0) {
+            db.exec(`
+              INSERT INTO positions (${insertCols})
+              SELECT ${selectCols} FROM positions_backup;
+            `);
+          }
+          
+          // 4. Drop the backup table
+          db.exec("DROP TABLE IF EXISTS positions_backup;");
+        })();
+        console.log("✅ Reconstructed positions table with complete schema and successfully migrated existing data!");
+      }
+    } else {
+      console.log("✅ positions table schema is up to date (contains amount_raw and decimals).");
     }
-  } catch (err) {
+  } catch (err: any) {
     console.error("⚠️ Failed during positions table sanity check/migration:", err);
   }
 
